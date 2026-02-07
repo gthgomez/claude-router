@@ -1,0 +1,862 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "meta": {
+    "document_version": "2.1.0",
+    "last_updated": "2026-01-19T22:00:00Z",
+    "project_name": "Claude Router",
+    "description": "Intelligent model selection system routing queries between Claude Opus/Sonnet/Haiku based on complexity",
+    "owner": "Jonathan",
+    "llm_optimization": {
+      "target_models": ["claude-opus-4.5", "claude-sonnet-4.5", "claude-haiku-4.5"],
+      "context_strategy": "hierarchical_compaction",
+      "token_budget": "optimal_under_35k",
+      "update_protocol": "append_to_change_log_and_increment_version"
+    },
+    "session_handoff": {
+      "instructions": "START PROTOCOL: (1) Read full document, prioritize recent_changes/active_issues. (2) Update current_session with new session_id. (3) Check dependency_graph before editing files. (4) After changes, append to recent_changes with timestamp and validation steps. (5) Update active_issues if resolved/created.",
+      "priority_sections": ["recent_changes", "active_issues", "dependency_graph", "forbidden_patterns"]
+    }
+  },
+  
+  "current_session": {
+    "session_id": "session_2026-01-19_context_audit_patches",
+    "started_at": "2026-01-19T22:00:00Z",
+    "focus": "Validate context.json audit claims and apply 5 critical patches (file map, env vars, dependency graph, testing protocols)",
+    "status": "completed",
+    "previous_session": "session_2026-01-19_optimization"
+  },
+
+  "project_status": {
+    "current_phase": "production_early_stage",
+    "deployment_maturity": "high_velocity_iteration",
+    "rollback_experience": "none_yet",
+    "security_posture": "compliance_focused",
+    "deployment": {
+      "backend": "supabase_edge_functions",
+      "frontend": "localhost_development",
+      "database": "supabase_postgresql"
+    },
+    "health": {
+      "backend_auth": "working",
+      "model_routing": "working",
+      "manual_override": "fixed_pending_deployment",
+      "multi_file_upload": "working",
+      "token_refresh": "working"
+    }
+  },
+
+  "project_structure": {
+    "generation_method": "PowerShell & Visual Verification",
+    "last_verified": "2026-01-19",
+    "roots": {
+      "frontend": "claude-router-frontend/",
+      "backend": "supabase/",
+      "types": "claude-router-frontend/src/types.ts"
+    },
+    "critical_paths": {
+      "api_entry": "supabase/functions/router/index.ts",
+      "frontend_entry": "claude-router-frontend/src/App.tsx",
+      "auth_logic": "claude-router-frontend/src/smartFetch.ts",
+      "type_definitions": "claude-router-frontend/src/types.ts",
+      "supabase_client": "claude-router-frontend/src/lib/supabase.ts"
+    },
+    "file_map": {
+      "frontend": {
+        "root": [
+          "package.json",
+          "vite.config.ts",
+          "tsconfig.json",
+          "index.html"
+        ],
+        "src": [
+          "App.tsx",
+          "main.tsx",
+          "config.ts",
+          "types.ts",
+          "utils.ts",
+          "smartFetch.ts",
+          "ModelIndicator.tsx"
+        ],
+        "src/components": [
+          "Auth.tsx",
+          "ChatInterface.tsx",
+          "ContextStatus.tsx",
+          "ContextWarning.tsx",
+          "FileUpload.tsx"
+        ],
+        "src/hooks": [
+          "useAuth.ts",
+          "useContextManager.ts"
+        ],
+        "src/services": [
+          "contextManager.ts",
+          "storageService.ts"
+        ],
+        "src/lib": [
+          "supabase.ts"
+        ]
+      },
+      "backend": {
+        "root": [
+          "config.toml",
+          "router-stream-context.md"
+        ],
+        "functions": [
+          "deno.json"
+        ],
+        "functions/router": [
+          "index.ts"
+        ],
+        "hooks": [
+          "suseRouterStream.ts"
+        ]
+      },
+      "tests": {
+        "location": "Tests/",
+        "files": [
+          "Router_test.ts",
+          "Router_test_v2.ts"
+        ],
+        "framework": "Deno native test runner",
+        "run_command": "deno test Tests/Router_test_v2.ts --allow-net --allow-env"
+      }
+    },
+    "modification_frequency": {
+      "high": [
+        "supabase/functions/router/index.ts",
+        "claude-router-frontend/src/components/ChatInterface.tsx",
+        "claude-router-frontend/src/smartFetch.ts"
+      ],
+      "medium": [
+        "claude-router-frontend/src/types.ts",
+        "claude-router-frontend/src/services/contextManager.ts"
+      ],
+      "low": [
+        "claude-router-frontend/src/lib/supabase.ts",
+        "claude-router-frontend/vite.config.ts"
+      ]
+    }
+  },
+
+  "dependency_graph": {
+    "supabase/functions/router/index.ts": {
+      "description": "Main API entry point + routing algorithm (formerly Router_logic_v2.ts merged into this file)",
+      "imports": [
+        "none - self-contained routing logic"
+      ],
+      "tested_by": [
+        "Tests/Router_test_v2.ts (OUTDATED - imports old Router_logic_v2.ts filename)"
+      ],
+      "exports": [
+        "HTTP handler via Deno.serve()",
+        "determineRoute() function",
+        "countTokens() function",
+        "RouterInput interface"
+      ],
+      "depends_on_env": [
+        "ANTHROPIC_API_KEY (set in Supabase Dashboard)",
+        "SUPABASE_SERVICE_ROLE_KEY (set in Supabase Dashboard)"
+      ],
+      "modification_impact": "critical - contains both API handler AND routing algorithm",
+      "hot_file": true,
+      "notes": "Router_logic_v2.ts was the old filename before logic was consolidated into index.ts"
+    },
+    "Tests/Router_test_v2.ts": {
+      "description": "NAMIT framework test suite ensuring routing reliability",
+      "status": "OUTDATED - imports from Router_logic_v2.ts which no longer exists",
+      "tests": [
+        "index.ts (but imports reference old filename)"
+      ],
+      "test_command": "deno test Tests/Router_test_v2.ts --allow-net --allow-env (WILL FAIL - needs update)",
+      "required_fixes": [
+        "Update import: from '../supabase/functions/router/Router_logic_v2.ts' to '../supabase/functions/router/index.ts'",
+        "Update import path to match current project structure"
+      ],
+      "coverage": {
+        "null_edge": "5 tests - empty queries, whitespace, boundary conditions",
+        "mandatory_boundary": "5 tests - context overflow, complexity triggers, mobile optimization",
+        "inverse_override": "4 tests - mobile complexity bypass, code task elevation",
+        "adversarial_stickiness": "5 tests - short inputs, multi-questions, edge cases"
+      },
+      "must_pass_before": "deployment (after fixing imports)"
+    },
+    "Tests/Router_test.ts": {
+      "description": "Earlier version of test suite",
+      "status": "OUTDATED - imports from ../Router_Functions/Router_logic.ts which doesn't exist",
+      "required_fixes": [
+        "Update import path to reference current index.ts location",
+        "Consider migrating to Router_test_v2.ts which has better NAMIT coverage"
+      ]
+    },
+    "claude-router-frontend/src/App.tsx": {
+      "description": "Frontend entry point and main component orchestration",
+      "imports": [
+        "components/ChatInterface.tsx",
+        "components/Auth.tsx",
+        "lib/supabase.ts",
+        "smartFetch.ts"
+      ],
+      "modification_impact": "medium - UI changes, test in browser"
+    },
+    "claude-router-frontend/src/components/ChatInterface.tsx": {
+      "description": "Main chat UI component with message handling",
+      "imports": [
+        "../smartFetch.ts",
+        "../types.ts",
+        "../ModelIndicator.tsx",
+        "FileUpload.tsx"
+      ],
+      "modification_impact": "high - core user interaction",
+      "hot_file": true
+    },
+    "claude-router-frontend/src/smartFetch.ts": {
+      "description": "Auth-aware fetch wrapper with token refresh",
+      "imports": [
+        "lib/supabase.ts",
+        "types.ts"
+      ],
+      "imported_by": [
+        "components/ChatInterface.tsx",
+        "App.tsx"
+      ],
+      "depends_on_env": [
+        "VITE_SUPABASE_URL",
+        "VITE_SUPABASE_ANON_KEY"
+      ],
+      "modification_impact": "high - affects all API calls",
+      "hot_file": true
+    },
+    "claude-router-frontend/src/types.ts": {
+      "description": "Shared TypeScript type definitions",
+      "imported_by": [
+        "multiple files across frontend"
+      ],
+      "modification_impact": "medium - affects type checking across project"
+    }
+  },
+
+  "environment_variables": {
+    "frontend": {
+      "file_location": ".env (in frontend root)",
+      "variables": [
+        "VITE_SUPABASE_URL",
+        "VITE_SUPABASE_ANON_KEY",
+        "VITE_ROUTER_ENDPOINT",
+        "VITE_DEV_MODE"
+      ],
+      "example_values": {
+        "VITE_SUPABASE_URL": "https://sqjfbqjogylkfwzsyprd.supabase.co",
+        "VITE_SUPABASE_ANON_KEY": "sb_publishable_...",
+        "VITE_ROUTER_ENDPOINT": "https://sqjfbqjogylkfwzsyprd.functions.supabase.co/router",
+        "VITE_DEV_MODE": "false"
+      },
+      "notes": [
+        "All frontend env vars must be prefixed with VITE_",
+        "Access via import.meta.env.VITE_*",
+        "Values are embedded in build, not runtime secrets"
+      ]
+    },
+    "backend": {
+      "file_location": "NONE - Edge Functions don't use .env files",
+      "setup_method": "Supabase Dashboard → Edge Functions → router → Settings → Environment Variables",
+      "variables": [
+        "ANTHROPIC_API_KEY",
+        "SUPABASE_SERVICE_ROLE_KEY"
+      ],
+      "access_method": "Deno.env.get('VARIABLE_NAME')",
+      "notes": [
+        "Edge functions run in Deno runtime, not Node.js",
+        "Environment variables set in Supabase Dashboard only",
+        "NEVER use process.env (use Deno.env.get)",
+        "Service role key has admin access - never expose in frontend"
+      ]
+    },
+    "security_critical": [
+      "NEVER commit .env to git (use .env.local for local dev)",
+      "NEVER expose SUPABASE_SERVICE_ROLE_KEY in frontend code",
+      "NEVER log API keys in console or error messages",
+      "Frontend env vars are PUBLIC - don't store secrets there"
+    ]
+  },
+
+  "recent_changes": [
+    {
+      "timestamp": "2026-01-19T22:00:00Z",
+      "session_id": "session_2026-01-19_context_audit_patches",
+      "type": "optimization",
+      "severity": "high",
+      "description": "Applied 5 critical patches from context audit validation",
+      "root_cause": "File map discrepancies and missing operational context discovered during audit",
+      "affected_sections": [
+        "file_map",
+        "dependency_graph",
+        "environment_variables",
+        "deployment_schedule",
+        "testing_protocols",
+        "keyword_weights"
+      ],
+      "patches_applied": [
+        "PATCH 1: Fixed ModelIndicator.tsx path (moved from src/components to src/)",
+        "PATCH 1: Removed Router_logic_v2.ts from backend (old filename - logic now in index.ts)",
+        "PATCH 1: Added Tests/ directory with Router_test.ts and Router_test_v2.ts (marked as OUTDATED)",
+        "PATCH 2: Added environment_variables section matching actual .env structure",
+        "PATCH 3: Updated complexity keywords (added 'deep research', 'system design', 'cyberattack', 'security', 'production')",
+        "PATCH 4: Added deployment_schedule section (daily deploys, testing requirements)",
+        "PATCH 5: Updated dependency_graph noting index.ts contains all logic and test files need updating"
+      ],
+      "validation_checklist": [
+        "Verify file imports reference correct paths",
+        "UPDATE REQUIRED: Fix test files to import from index.ts instead of Router_logic_v2.ts",
+        "After fixing imports, run: deno test Tests/Router_test_v2.ts --allow-net --allow-env",
+        "Verify all NAMIT scenarios pass",
+        "Check dependency_graph matches actual project structure",
+        "Confirm env vars documented match .env requirements and Supabase Dashboard"
+      ],
+      "epistemic_improvement": "Grounding score improved from 5 verified to 8 verified with dependency tracking"
+    },
+    {
+      "timestamp": "2026-01-19T18:00:00Z",
+      "session_id": "session_2026-01-19_cors_fix",
+      "type": "bugfix",
+      "severity": "critical",
+      "description": "Fixed CORS - frontend couldn't read X-Claude-Model header",
+      "root_cause": "Missing Access-Control-Expose-Headers in CORS config",
+      "affected_files": ["supabase/functions/router/index.ts"],
+      "changes_made": ["Added 'Access-Control-Expose-Headers': 'X-Claude-Model, X-Router-Rationale, X-Complexity-Score' to CORS_HEADERS"],
+      "validation_checklist": [
+        "Deploy: supabase functions deploy router",
+        "Test with test-cors-headers.html",
+        "Verify browser console shows model: 'haiku-4.5'",
+        "Check UI model badge displays correct model",
+        "Test all 3 models manually"
+      ],
+      "files_created": [
+        "index-CORS-FIXED.ts",
+        "CORS_FIX_SUMMARY.md",
+        "test-cors-headers.html"
+      ]
+    },
+    {
+      "timestamp": "2026-01-19T17:30:00Z",
+      "session_id": "session_2026-01-19_cors_fix",
+      "type": "diagnostic",
+      "description": "Deployed debug backend with logging to diagnose model override",
+      "affected_files": ["supabase/functions/router/index.ts"],
+      "findings": [
+        "Backend receives modelOverride correctly",
+        "Backend routes to correct model",
+        "Backend sends X-Claude-Model header",
+        "Frontend blocked by CORS from reading header"
+      ],
+      "files_created": ["index-debug.ts"]
+    },
+    {
+      "timestamp": "2026-01-19T12:00:00Z",
+      "session_id": "session_2026-01-18_session_fix",
+      "type": "bugfix",
+      "description": "Fixed session expiration and JWT refresh",
+      "affected_files": [
+        "claude-router-frontend/src/smartFetch.ts",
+        "supabase/functions/router/index.ts"
+      ],
+      "changes_made": [
+        "Added auto token refresh in smartFetch.ts getAccessToken()",
+        "Replaced authClient.auth.getUser() with manual JWT verify",
+        "Added extractBearerToken() and verifyJWT() helpers"
+      ]
+    }
+  ],
+
+  "active_issues": [
+    {
+      "id": "CORS-001",
+      "status": "fixed_pending_deployment",
+      "severity": "critical",
+      "title": "Manual model override defaults to Sonnet",
+      "root_cause": "CORS blocks custom response headers",
+      "solution": "Add Access-Control-Expose-Headers to backend",
+      "deployment_required": true
+    }
+  ],
+
+  "tech_stack": {
+    "runtime": {
+      "backend": {
+        "platform": "Deno",
+        "version": "latest",
+        "environment": "Supabase Edge Functions",
+        "syntax_rules": [
+          "Use Deno.env.get() for env vars",
+          "Import npm packages: import { X } from 'npm:package@version'",
+          "No package.json - runtime resolution",
+          "Use Deno.serve() for HTTP",
+          "Ephemeral filesystem - no file writes"
+        ]
+      },
+      "frontend": {
+        "framework": "React 18",
+        "build_tool": "Vite",
+        "language": "TypeScript",
+        "syntax_rules": [
+          ".tsx for React components",
+          ".ts for utilities/types",
+          "import.meta.env.VITE_* for env vars",
+          "Functional components + hooks only",
+          "Use React.FC<Props> for types"
+        ]
+      }
+    },
+    
+    "forbidden_patterns": {
+      "backend_deno": [
+        "NEVER use process.env (use Deno.env.get)",
+        "NEVER use require() (use ESM imports)",
+        "NEVER use fs.writeFile (ephemeral filesystem)",
+        "NEVER use __dirname or __filename (doesn't exist)",
+        "NEVER use npm install in functions (use npm: imports)",
+        "NEVER use node: protocol imports"
+      ],
+      "frontend_react": [
+        "NEVER use class components (hooks only)",
+        "NEVER forget dependency arrays in useEffect",
+        "NEVER mutate state directly (use setState)",
+        "NEVER use window.env (use import.meta.env)",
+        "NEVER import from 'node:*' (browser context)"
+      ],
+      "typescript": [
+        "NEVER mix Deno/Node imports (check context)",
+        "NEVER ignore null/undefined checks",
+        "NEVER cast 'as any' without comment",
+        "NEVER use 'string' for ModelTier (use literal types)"
+      ]
+    },
+
+    "languages": {
+      "typescript": {
+        "version": "5.x",
+        "strict_mode": true,
+        "common_errors": [
+          "Mixing Deno/Node imports → check runtime",
+          "Using Node globals in Deno → use Deno.* equivalents",
+          "Missing null/undefined checks → use optional chaining",
+          "Type mismatches → ModelTier literal vs string"
+        ]
+      }
+    },
+
+    "frameworks": {
+      "react": {
+        "version": "18.x",
+        "state_management": "useState, useRef, useEffect",
+        "styling": "inline CSS-in-JS",
+        "patterns": [
+          "useState for state",
+          "useRef for DOM/mutable values",
+          "useEffect for side effects + cleanup",
+          "Always provide dependency arrays",
+          "Handle loading states for async"
+        ]
+      },
+      "supabase": {
+        "client_version": "@supabase/supabase-js@2",
+        "auth_flow": "JWT with auto-refresh",
+        "database": "PostgreSQL",
+        "storage": "Supabase Storage for uploads",
+        "edge_functions": "Deno-based serverless"
+      }
+    },
+
+    "apis": {
+      "anthropic": {
+        "version": "2023-06-01",
+        "endpoint": "https://api.anthropic.com/v1/messages",
+        "authentication": "x-api-key header",
+        "models": {
+          "opus": "claude-opus-4-20241210",
+          "sonnet": "claude-sonnet-4-20250514",
+          "haiku": "claude-haiku-4-20250514"
+        },
+        "rate_limits": {
+          "tier1": "50 req/min, 50k tokens/min",
+          "tier2": "1000 req/min, 2M tokens/min"
+        },
+        "streaming": {
+          "enabled": true,
+          "content_type": "text/event-stream",
+          "parsing": "SSE format - parse 'data: ' prefix"
+        }
+      }
+    }
+  },
+
+  "dependency_graph": {
+    "description": "File relationships - check before editing",
+    "map": {
+      "supabase/functions/router/index.ts": {
+        "depends_on": [],
+        "imported_by": [],
+        "calls_api": ["Anthropic API"],
+        "modifies": ["response headers", "SSE stream"]
+      },
+      "claude-router-frontend/src/smartFetch.ts": {
+        "depends_on": [
+          "claude-router-frontend/src/lib/supabase.ts",
+          "claude-router-frontend/src/types.ts"
+        ],
+        "imported_by": [
+          "claude-router-frontend/src/components/ChatInterface.tsx"
+        ],
+        "calls_api": ["supabase/functions/router"]
+      },
+      "claude-router-frontend/src/components/ChatInterface.tsx": {
+        "depends_on": [
+          "claude-router-frontend/src/smartFetch.ts",
+          "claude-router-frontend/src/types.ts",
+          "claude-router-frontend/src/components/FileUpload.tsx",
+          "claude-router-frontend/src/components/ModelIndicator.tsx",
+          "claude-router-frontend/src/hooks/useContextManager.ts"
+        ],
+        "imported_by": [
+          "claude-router-frontend/src/App.tsx"
+        ]
+      },
+      "claude-router-frontend/src/types.ts": {
+        "depends_on": [],
+        "imported_by": [
+          "claude-router-frontend/src/smartFetch.ts",
+          "claude-router-frontend/src/components/ChatInterface.tsx",
+          "claude-router-frontend/src/services/contextManager.ts"
+        ],
+        "note": "Shared type definitions - changes affect many files"
+      }
+    }
+  },
+
+  "common_errors": {
+    "CORS": {
+      "symptom": "Network request succeeds but headers/response unreadable in JS",
+      "cause": "Missing Access-Control-* headers in backend",
+      "frontend_solution": "Check Network tab → verify headers sent",
+      "backend_solution": "Add to CORS_HEADERS: 'Access-Control-Expose-Headers': 'X-Custom-Header'",
+      "validation": "Use test-cors-headers.html utility"
+    },
+    "AUTH": {
+      "symptom": "401 Unauthorized or 'Invalid token' errors",
+      "cause": "Expired JWT or missing refresh logic",
+      "frontend_solution": "Check smartFetch.ts getAccessToken() calls supabase.auth.refreshSession()",
+      "backend_solution": "Verify JWT with jose library, check 'sub' claim extraction",
+      "validation": "Test after 60min idle → should auto-refresh"
+    },
+    "SSE_PARSING": {
+      "symptom": "Streaming broken or garbled text",
+      "cause": "Not parsing SSE format correctly",
+      "frontend_solution": "Parse lines with 'data: ' prefix, handle multiple events",
+      "backend_solution": "Ensure reader.read() handles chunks properly",
+      "validation": "Send long message → check incremental rendering"
+    },
+    "TYPE_ERRORS": {
+      "symptom": "TS errors about ModelTier string mismatch",
+      "cause": "Using 'string' instead of literal type 'opus-4.5' | 'sonnet-4.5' | 'haiku-4.5'",
+      "frontend_solution": "Cast as ModelTier: const model = 'opus-4.5' as ModelTier",
+      "backend_solution": "Use type guards or validation before assignment",
+      "validation": "Run npm run type-check"
+    },
+    "DENO_IMPORTS": {
+      "symptom": "Module not found or import errors in Deno",
+      "cause": "Using Node-style imports or wrong version",
+      "backend_solution": "Use npm: prefix with version: import { X } from 'npm:@pkg/name@2'",
+      "validation": "Deploy and check function logs"
+    },
+    "MODULE_NOT_FOUND": {
+      "symptom": "Module not found errors",
+      "cause": "Import path wrong or package missing",
+      "frontend_solution": "npm install <package>",
+      "backend_solution": "Check npm: prefix and version",
+      "validation": "Run dev server, check console"
+    }
+  },
+
+  "rollback_procedures": {
+    "backend": {
+      "emergency_rollback": [
+        "Find working commit: git log supabase/functions/router/index.ts",
+        "Checkout: git checkout <commit-hash> supabase/functions/router/index.ts",
+        "Deploy: supabase functions deploy router",
+        "Monitor: supabase functions logs router --tail",
+        "Verify: Send test message from frontend"
+      ],
+      "validation_window": "Monitor logs for 5min after deployment"
+    },
+    "frontend": {
+      "emergency_rollback": [
+        "Find working commit: git log src/",
+        "Checkout: git checkout <commit-hash> src/",
+        "Install: npm install",
+        "Test: npm run dev",
+        "Verify: Open localhost:5173, check console for errors"
+      ],
+      "validation_window": "Test all features before declaring stable"
+    },
+    "database": {
+      "emergency_rollback": [
+        "Check migration history in Supabase dashboard",
+        "Revert migration if needed (use Supabase UI)",
+        "If manual SQL: Keep backup queries in router-stream-context.md"
+      ]
+    }
+  },
+
+  "testing_protocols": {
+    "router_logic": {
+      "framework": "NAMIT (Null, Mandatory, Inverse, Adversarial)",
+      "test_file": "Tests/Router_test_v2.ts",
+      "status": "NEEDS UPDATE - imports reference old Router_logic_v2.ts filename",
+      "description": "Comprehensive routing algorithm validation",
+      "categories": {
+        "null_edge": "Empty queries, whitespace, boundary conditions (>150k tokens)",
+        "mandatory_boundary": "Critical paths: context overflow, complexity triggers, mobile optimization",
+        "inverse_override": "Exception cases: mobile+complexity, code task elevation",
+        "adversarial_stickiness": "Edge cases: short inputs, multi-questions, rationale tag coverage"
+      },
+      "required_fix": "Change import from '../supabase/functions/router/Router_logic_v2.ts' to '../supabase/functions/router/index.ts'",
+      "run_command": "deno test Tests/Router_test_v2.ts --allow-net --allow-env (will fail until imports fixed)",
+      "coverage_required": "All 4 NAMIT categories must pass before deployment",
+      "expected_tests": "40+ assertions across N/M/I/A spectrum"
+    },
+    "backend_deployment": {
+      "steps": [
+        "Review changes in index.ts",
+        "Deploy: supabase functions deploy router",
+        "Check logs: supabase functions logs router --tail",
+        "Send test message from frontend",
+        "Verify logs show expected behavior",
+        "Test all paths: auto-routing, manual override, errors"
+      ],
+      "validation_queries": [
+        "Simple 'test' → Haiku (low complexity)",
+        "Medium 'Write array sort function' → Sonnet",
+        "Complex 'Analyze microservices vs monoliths' → Opus",
+        "Manual override: Select Haiku + complex query → Use Haiku"
+      ]
+    },
+    
+    "frontend_changes": {
+      "steps": [
+        "Run: npm run dev",
+        "Check browser console for errors",
+        "Test user flow end-to-end",
+        "Check Network tab for failed requests",
+        "Verify [smartFetch] and [ChatInterface] logs",
+        "Test edge cases: empty input, max length, special chars"
+      ]
+    },
+    
+    "cors_headers": {
+      "tool": "test-cors-headers.html",
+      "steps": [
+        "Open test-cors-headers.html",
+        "Fill endpoint, token, conversation ID",
+        "Run 'Check if Custom Headers are Exposed'",
+        "Verify all headers show ✅",
+        "Run 'Verify Manual Override Works'",
+        "Confirm model matches request"
+      ]
+    },
+    
+    "multi_file_upload": {
+      "test_cases": [
+        "Single text → appended to query",
+        "Single image → sent in images array",
+        "Multiple images → all in images array",
+        "Mixed text+images → text in query, images in array",
+        "Large file → handle or error if >MAX_QUERY_LENGTH"
+      ]
+    }
+  },
+
+  "deployment_checklist": {
+    "pre_deployment": [
+      "Review recent_changes",
+      "Run: npm run type-check",
+      "Clean console.log or mark intentional",
+      "Verify env vars set",
+      "Test locally with dev server"
+    ],
+    
+    "deployment": {
+      "backend": [
+        "supabase functions deploy router",
+        "Check Supabase dashboard for success",
+        "Tail logs: supabase functions logs router --tail"
+      ],
+      "frontend": [
+        "npm run build",
+        "Test production build locally",
+        "Deploy to hosting (when ready for prod)"
+      ]
+    },
+    
+    "post_deployment": [
+      "Smoke test: Send simple message",
+      "Test manual override: Select each model",
+      "Test file upload: Single + multiple",
+      "Monitor logs for errors",
+      "Update document with deployment results"
+    ]
+  },
+
+  "deployment_schedule": {
+    "frequency": "daily",
+    "typical_window": "end_of_day",
+    "rollback_policy": "immediate_on_production_errors",
+    "testing_before_deploy": [
+      "Run: deno test Tests/Router_test_v2.ts --allow-net --allow-env",
+      "Verify all NAMIT scenarios pass (Null, Mandatory, Inverse, Adversarial)",
+      "Smoke test locally with npm run dev",
+      "Check console for errors"
+    ],
+    "post_deploy_validation": [
+      "Send test message through frontend",
+      "Verify model routing works for all 3 models",
+      "Check Supabase logs for errors",
+      "Test manual override functionality"
+    ]
+  },
+
+  "context_management_strategy": {
+    "approach": "Hierarchical document with prioritized sections",
+    "token_budget": {
+      "target": "Under 35k tokens",
+      "priority_tier_1": ["recent_changes", "active_issues", "current_session"],
+      "priority_tier_2": ["dependency_graph", "common_errors", "forbidden_patterns"],
+      "priority_tier_3": ["testing_protocols", "deployment_checklist"]
+    },
+    
+    "compaction_rules": {
+      "when_to_compact": "When recent_changes >20 entries",
+      "method": "Summarize changes >30 days into archived_changes_summary",
+      "preserve": "Critical fixes and architecture changes in full"
+    },
+    
+    "update_protocol": {
+      "after_each_session": [
+        "Update current_session with end status",
+        "Append to recent_changes (timestamp + details)",
+        "Update active_issues (close/create/update)",
+        "Add dependencies if files created/modified",
+        "Increment meta.document_version"
+      ],
+      "session_start": [
+        "Read full document, prioritize tier_1",
+        "Check recent_changes for latest context",
+        "Update current_session.session_id",
+        "Review active_issues for current problems"
+      ]
+    }
+  },
+
+  "llm_instructions": {
+    "critical_protocol": {
+      "session_start": [
+        "READ THIS FIRST: This document is your persistent memory",
+        "Prioritize: recent_changes, active_issues, forbidden_patterns",
+        "Update current_session with new session_id and focus",
+        "Check dependency_graph before editing files"
+      ],
+      "before_code_changes": [
+        "MANDATORY: Check forbidden_patterns for runtime (Deno vs React)",
+        "MANDATORY: Review dependency_graph for file relationships",
+        "MANDATORY: Consult common_errors for known issues",
+        "Use tech_stack.syntax_rules for correct syntax"
+      ],
+      "after_changes": [
+        "MANDATORY: Append to recent_changes with timestamp",
+        "MANDATORY: Include validation checklist",
+        "MANDATORY: List affected_files",
+        "MANDATORY: Update active_issues if resolved/created",
+        "Increment meta.document_version"
+      ],
+      "debugging": [
+        "Check common_errors first for similar symptoms",
+        "Review recent_changes for related changes",
+        "Use testing_protocols to validate fix",
+        "Document root_cause in recent_changes"
+      ]
+    },
+    
+    "context_retention": [
+      "This document is your memory across sessions",
+      "Always update after changes - future sessions depend on it",
+      "Be specific - future you won't remember details",
+      "Include what changed AND why",
+      "Provide validation steps to verify fix works"
+    ]
+  },
+
+  "knowledge_base": {
+    "key_concepts": {
+      "model_routing": {
+        "description": "Auto-select Opus/Sonnet/Haiku based on complexity",
+        "algorithm": {
+          "formula": "base_score + (keyword_weight × keyword_count) + (length_multiplier × char_count) + (context_size_factor × context_tokens)",
+          "base_score": 10,
+          "keyword_weights": {
+            "deep research": 15,
+            "system design": 15,
+            "architecture": 15,
+            "complex architecture": 15,
+            "cyberattack": 15,
+            "security": 12,
+            "production": 10,
+            "analyze": 15,
+            "refactor": 15,
+            "optimize": 12,
+            "compare": 12,
+            "design": 12,
+            "explain": 8,
+            "implement": 8,
+            "create": 8,
+            "debug": 5,
+            "fix": 5,
+            "list": 3,
+            "show": 3
+          },
+          "length_multiplier": 0.05,
+          "context_size_factor": 0.0001
+        },
+        "thresholds": {
+          "haiku": "score ≤ 25 AND tokens < 100 AND total < 10k",
+          "opus": "score ≥ 75 OR tokens > 100k",
+          "sonnet": "default (everything else)"
+        },
+        "manual_override": "User can manually select model, bypassing auto-routing"
+      },
+      
+      "jwt_authentication": {
+        "description": "Supabase JWT tokens for API auth",
+        "flow": "Frontend → getSession → extract access_token → send as Bearer → backend verifies",
+        "refresh": "Auto if token expires <60s (smartFetch.ts handles)",
+        "verification": "Backend decodes JWT, extracts user_id from 'sub' claim"
+      },
+      
+      "cors_headers": {
+        "description": "Cross-Origin Resource Sharing config",
+        "critical_setting": "Access-Control-Expose-Headers: lists headers JS can read",
+        "common_mistake": "Forgetting to expose custom headers like X-Claude-Model",
+        "debugging": "Network tab → Response Headers → check if JS can read"
+      }
+    },
+    
+    "reference_links": {
+      "anthropic_api": "https://docs.anthropic.com/en/api/messages",
+      "supabase_edge_functions": "https://supabase.com/docs/guides/functions",
+      "deno_manual": "https://deno.land/manual",
+      "cors_mdn": "https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS"
+    }
+  },
+
+  "archived_changes_summary": {
+    "description": "Changes >30 days old (summarized to save tokens)",
+    "entries": []
+  }
+}

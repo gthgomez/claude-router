@@ -1,0 +1,20 @@
+table_name,column_name,data_type
+conversations,id,uuid
+conversations,user_id,uuid
+conversations,title,text
+conversations,created_at,timestamp with time zone
+conversations,total_token_count,integer
+messages,id,uuid
+messages,conversation_id,uuid
+messages,topic,text
+messages,role,text
+messages,content,text
+messages,extension,text
+messages,token_count,integer
+messages,payload,jsonb
+messages,event,text
+messages,created_at,timestamp with time zone
+messages,private,boolean
+messages,updated_at,timestamp without time zone
+messages,inserted_at,timestamp without time zone
+messages,id,uuid
