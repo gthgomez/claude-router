@@ -7,6 +7,25 @@ import { createClient } from 'npm:@supabase/supabase-js@2';
 // TYPE DEFINITIONS
 // ============================================================================
 
+// Database types
+interface Conversation {
+  id: string;
+  user_id: string;
+  total_tokens: number;
+  created_at?: string;
+}
+
+interface MessageRecord {
+  id?: string;
+  conversation_id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  token_count: number;
+  model_used?: string | undefined;
+  image_url?: string | undefined;
+  created_at?: string;
+}
+
 interface Message {
   role: 'user' | 'assistant';
   content: string;
@@ -25,7 +44,7 @@ interface RouterParams {
   platform: 'web' | 'mobile';
   history: Message[];
   images?: ImageAttachment[];
-  imageStorageUrl?: string;
+  imageStorageUrl?: string | undefined;
 }
 
 interface RouteDecision {
@@ -268,7 +287,7 @@ function verifyJWT(token: string): { user_id: string; exp?: number } | null {
     const parts = token.split('.');
     if (parts.length !== 3) return null;
 
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+    const payload = JSON.parse(atob(parts[1]!.replace(/-/g, '+').replace(/_/g, '/')));
 
     if (payload.exp && payload.exp < Date.now() / 1000) {
       console.error('[JWT] Token expired');
@@ -301,12 +320,14 @@ async function validateConversation(
     .maybeSingle();
 
   if (error || !conv) {
-    await supabase.from('conversations').insert({ id: conversationId, user_id: userId, total_tokens: 0 });
+    const newConv: Conversation = { id: conversationId, user_id: userId, total_tokens: 0 };
+    await supabase.from('conversations').insert(newConv as any);
     return { valid: true, tokenCount: 0 };
   }
 
-  if (conv.user_id !== userId) return { valid: false, tokenCount: 0 };
-  return { valid: true, tokenCount: conv.total_tokens || 0 };
+  const conversation = conv as Conversation;
+  if (conversation.user_id !== userId) return { valid: false, tokenCount: 0 };
+  return { valid: true, tokenCount: conversation.total_tokens || 0 };
 }
 
 function persistMessageAsync(
@@ -320,16 +341,21 @@ function persistMessageAsync(
 ): void {
   (async () => {
     try {
+      const messageRecord: MessageRecord = {
+        conversation_id: conversationId,
+        role,
+        content,
+        token_count: tokenCount,
+        model_used: modelUsed || undefined,
+        image_url: imageUrl || undefined
+      };
+
       await Promise.all([
-        supabase.from('messages').insert({
-          conversation_id: conversationId,
-          role, content, token_count: tokenCount,
-          model_used: modelUsed, image_url: imageUrl
-        }),
+        supabase.from('messages').insert(messageRecord as any),
         supabase.rpc('increment_token_count', {
           p_conversation_id: conversationId,
           p_tokens: tokenCount
-        })
+        } as any)
       ]);
     } catch (err) {
       console.error('[DB] Persist failed:', err);
@@ -452,10 +478,11 @@ Deno.serve(async (req: Request) => {
 
     const supabaseClient = createClient(
       Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+      { db: { schema: 'public' } }
     );
 
-    const ownership = await validateConversation(supabaseClient, conversationId, userId);
+    const ownership = await validateConversation(supabaseClient as any, conversationId, userId);
     if (!ownership.valid) {
       return new Response(JSON.stringify({ error: 'Forbidden: Invalid conversation ownership' }), {
         status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
@@ -511,7 +538,7 @@ Deno.serve(async (req: Request) => {
 
     const userTokenCount = countTokens(query) + countImageTokens(imageAttachments);
     persistMessageAsync(
-      supabaseClient,
+      supabaseClient as any,
       conversationId,
       'user',
       query,
