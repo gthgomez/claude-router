@@ -1,13 +1,27 @@
-// index.ts - Claude Router Edge Function
-// FIXED: CORS now exposes custom headers
+// index.ts - Multi-provider Router Edge Function (Anthropic + OpenAI + Google)
 
 import { createClient } from 'npm:@supabase/supabase-js@2';
+import {
+  countImageTokens,
+  countTokens,
+  determineRoute,
+  MODEL_REGISTRY,
+  normalizeModelOverride,
+  transformMessagesForClaude,
+  transformMessagesForGoogle,
+  transformMessagesForOpenAI,
+  type ImageAttachment,
+  type Message,
+  type Provider,
+  type RouteDecision,
+  type RouterModel,
+  type RouterParams,
+} from './router_logic.ts';
 
 // ============================================================================
 // TYPE DEFINITIONS
 // ============================================================================
 
-// Database types
 interface Conversation {
   id: string;
   user_id: string;
@@ -26,251 +40,431 @@ interface MessageRecord {
   created_at?: string;
 }
 
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
-  imageData?: string;
-  mediaType?: string;
-}
-
-interface ImageAttachment {
-  data: string;
-  mediaType: string;
-}
-
-interface RouterParams {
-  userQuery: string;
-  currentSessionTokens: number;
-  platform: 'web' | 'mobile';
-  history: Message[];
-  images?: ImageAttachment[];
-  imageStorageUrl?: string | undefined;
-}
-
-interface RouteDecision {
-  model: string;
-  modelTier: 'haiku-4.5' | 'sonnet-4.5' | 'opus-4.5';
-  budgetCap: number;
-  rationaleTag: string;
-  complexityScore: number;
+interface UpstreamCallResult {
+  response: Response;
+  extractDeltas: (payload: unknown) => string[];
 }
 
 // ============================================================================
 // CONSTANTS & CONFIGURATION
 // ============================================================================
 
-// âœ… FIX: Added Access-Control-Expose-Headers so frontend can read custom headers
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
-  'Access-Control-Expose-Headers': 'X-Claude-Model, X-Router-Rationale, X-Complexity-Score', // âœ… NEW
+  'Access-Control-Expose-Headers':
+    'X-Claude-Model, X-Claude-Model-Id, X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score',
 };
 
 const FUNCTION_TIMEOUT_MS = 55000;
 const MAX_QUERY_LENGTH = 50000;
 const DEV_MODE = Deno.env.get('DEV_MODE') === 'true';
-const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY');
 
-const MODELS = {
-  'haiku-4.5': 'claude-haiku-4-5-20251001',
-  'sonnet-4.5': 'claude-sonnet-4-5-20250929',
-  'opus-4.5': 'claude-opus-4-5-20251101'
-} as const;
+const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') || '';
+const OPENAI_API_KEY = Deno.env.get('OPENAI_API_KEY') || '';
+const GOOGLE_API_KEY = Deno.env.get('GOOGLE_API_KEY') || '';
 
-type ModelTier = keyof typeof MODELS;
-
-const COMPLEXITY_INDICATORS = {
-  opus: [
-    'analyze', 'research', 'comprehensive', 'detailed analysis',
-    'compare and contrast', 'evaluate', 'synthesize', 'critique',
-    'design', 'architect', 'strategy', 'in-depth', 'thorough',
-    'explain why', 'reasoning', 'implications', 'trade-offs',
-    'debug this', 'review this code', 'optimize', 'refactor'
-  ],
-  sonnet: [
-    'write', 'create', 'generate', 'draft', 'compose',
-    'explain', 'describe', 'summarize', 'translate',
-    'help me', 'how do i', 'what is', 'code', 'function',
-    'script', 'convert', 'format', 'list'
-  ],
-  haiku: [
-    'quick', 'simple', 'short', 'brief', 'yes or no',
-    'what time', 'how many', 'define', 'spell', 'calculate'
-  ]
-};
-
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-function transformMessagesForClaude(
-  messages: Message[], 
-  currentImages?: ImageAttachment[]
-) {
-  return messages.map((msg, index) => {
-    const isLastMessage = index === messages.length - 1;
-    
-    if (isLastMessage && msg.role === 'user' && currentImages && currentImages.length > 0) {
-      const contentArray: any[] = [];
-      
-      for (const img of currentImages) {
-        contentArray.push({
-          type: 'image',
-          source: {
-            type: 'base64',
-            media_type: img.mediaType || 'image/jpeg',
-            data: img.data,
-          },
-        });
-      }
-      
-      contentArray.push({
-        type: 'text',
-        text: msg.content || 'Please analyze these images.',
-      });
-      
-      return { role: msg.role, content: contentArray };
-    }
-    
-    if (msg.imageData) {
-      return {
-        role: msg.role,
-        content: [
-          {
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: msg.mediaType || 'image/jpeg',
-              data: msg.imageData,
-            },
-          },
-          {
-            type: 'text',
-            text: msg.content || 'Please analyze this image.',
-          },
-        ],
-      };
-    }
-    
-    return { role: msg.role, content: msg.content || '' };
-  });
+function envFlag(name: string, defaultValue: boolean): boolean {
+  const raw = Deno.env.get(name);
+  if (raw === null || raw === undefined || raw.trim() === '') return defaultValue;
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') {
+    return true;
+  }
+  if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') {
+    return false;
+  }
+  return defaultValue;
 }
 
-const tokenCache = new Map<string, number>();
-function countTokens(text: string): number {
-  if (!text) return 0;
-  if (tokenCache.has(text)) return tokenCache.get(text)!;
+const ENABLE_ANTHROPIC = envFlag('ENABLE_ANTHROPIC', true);
+const ENABLE_OPENAI = envFlag('ENABLE_OPENAI', true);
+const ENABLE_GOOGLE = envFlag('ENABLE_GOOGLE', true);
 
-  const words = text.split(/\s+/).length;
-  const chars = text.length;
-  const count = Math.ceil((words + chars / 4) / 2);
+// ============================================================================
+// PROVIDER HELPERS
+// ============================================================================
 
-  if (tokenCache.size < 100) tokenCache.set(text, count);
-  return count;
+function isProviderEnabled(provider: Provider): boolean {
+  switch (provider) {
+    case 'anthropic':
+      return ENABLE_ANTHROPIC;
+    case 'openai':
+      return ENABLE_OPENAI;
+    case 'google':
+      return ENABLE_GOOGLE;
+  }
 }
 
-function countImageTokens(images?: ImageAttachment[]): number {
-  if (!images || images.length === 0) return 0;
-  return images.length * 1600;
+function hasProviderCredentials(provider: Provider): boolean {
+  switch (provider) {
+    case 'anthropic':
+      return !!ANTHROPIC_API_KEY;
+    case 'openai':
+      return !!OPENAI_API_KEY;
+    case 'google':
+      return !!GOOGLE_API_KEY;
+  }
 }
 
-// ============================================================================
-// COMPLEXITY ANALYSIS
-// ============================================================================
-
-function analyzeComplexity(params: RouterParams): number {
-  let score = 50;
-  const query = params.userQuery.toLowerCase();
-  const queryTokens = countTokens(params.userQuery);
-  const historyTokens = params.currentSessionTokens;
-
-  if (queryTokens < 20) score -= 20;
-  else if (queryTokens < 50) score -= 10;
-  else if (queryTokens > 500) score += 15;
-  else if (queryTokens > 200) score += 10;
-
-  for (const keyword of COMPLEXITY_INDICATORS.opus) {
-    if (query.includes(keyword)) {
-      score += 5;
-      if (score > 75) break;
-    }
-  }
-  for (const keyword of COMPLEXITY_INDICATORS.haiku) {
-    if (query.includes(keyword)) {
-      score -= 5;
-      if (score < 25) break;
-    }
-  }
-
-  const questionWords = (query.match(/\b(why|how|what if|could|would|should|compare|versus|vs)\b/g) || []).length;
-  if (questionWords >= 3) score += 15;
-  else if (questionWords >= 2) score += 8;
-
-  if (query.includes(' and ') && query.includes('?')) score += 10;
-
-  const codeIndicators = [/```/, /\b(function|const|let|var|class|def|import|export)\b/, /[{}\[\]();]/, /\b(error|bug|fix|debug|crash|exception)\b/i];
-  let codeSignals = 0;
-  for (const pattern of codeIndicators) {
-    if (pattern.test(params.userQuery)) codeSignals++;
-  }
-  if (codeSignals >= 3) score += 15;
-  else if (codeSignals >= 2) score += 10;
-
-  const totalTokens = historyTokens + queryTokens;
-  if (totalTokens > 100000) score += 10;
-  else if (totalTokens > 50000) score += 5;
-
-  if (/\b(json|list|bullet|table|csv)\b/i.test(query) && queryTokens < 100) {
-    score -= 10;
-  }
-
-  if (/\b(write|story|poem|essay|blog|article|creative|fiction)\b/i.test(query)) {
-    if (score < 50) score = 50;
-    if (score > 70) score = 65;
-  }
-
-  return Math.max(0, Math.min(100, score));
+function isProviderReady(provider: Provider): boolean {
+  return isProviderEnabled(provider) && hasProviderCredentials(provider);
 }
 
-// ============================================================================
-// ROUTING LOGIC
-// ============================================================================
+function hasAtLeastOneProviderConfigured(): boolean {
+  return isProviderReady('anthropic') || isProviderReady('openai') || isProviderReady('google');
+}
 
-function determineRoute(params: RouterParams, modelOverride?: ModelTier): RouteDecision {
-  const hasImages = params.images && params.images.length > 0;
-  const complexityScore = analyzeComplexity(params);
-  const queryTokens = countTokens(params.userQuery) + countImageTokens(params.images);
-  const totalTokens = params.currentSessionTokens + queryTokens;
+function fallbackModel(): RouterModel | undefined {
+  if (isProviderReady('anthropic')) return 'sonnet-4.5';
+  if (isProviderReady('openai')) return 'gpt-5-mini';
+  if (isProviderReady('google')) return 'gemini-3-flash';
+  return undefined;
+}
 
-  // Manual override
-  if (modelOverride && MODELS[modelOverride]) {
+function decisionFromModel(modelTier: RouterModel, complexityScore: number, rationaleTag: string): RouteDecision {
+  const modelCfg = MODEL_REGISTRY[modelTier];
+  return {
+    provider: modelCfg.provider,
+    model: modelCfg.modelId,
+    modelTier,
+    budgetCap: modelCfg.budgetCap,
+    rationaleTag,
+    complexityScore,
+  };
+}
+
+function normalizeDecisionAgainstProviderAvailability(
+  decision: RouteDecision,
+  normalizedOverride: RouterModel | undefined,
+): { decision: RouteDecision; error?: string } {
+  if (isProviderReady(decision.provider)) {
+    return { decision };
+  }
+
+  if (normalizedOverride) {
     return {
-      model: MODELS[modelOverride],
-      modelTier: modelOverride,
-      budgetCap: modelOverride === 'opus-4.5' ? 16000 : modelOverride === 'sonnet-4.5' ? 8000 : 4000,
-      rationaleTag: 'manual-override',
-      complexityScore
+      decision,
+      error:
+        `Requested model '${normalizedOverride}' requires provider '${decision.provider}', ` +
+        `but it is not configured or enabled on the server.`,
     };
   }
 
-  // Auto-routing logic
-  if (hasImages) {
-    if (complexityScore > 60 || totalTokens > 50000) {
-      return { model: MODELS['opus-4.5'], modelTier: 'opus-4.5', budgetCap: 16000, rationaleTag: 'images-complex', complexityScore };
+  const fallback = fallbackModel();
+  if (!fallback) {
+    return {
+      decision,
+      error: 'No enabled provider has valid credentials configured on the server.',
+    };
+  }
+
+  const fallbackDecision = decisionFromModel(
+    fallback,
+    decision.complexityScore,
+    `provider-unavailable-fallback-${decision.provider}`,
+  );
+
+  return {
+    decision: fallbackDecision,
+  };
+}
+
+// ============================================================================
+// UPSTREAM DELTA EXTRACTORS
+// ============================================================================
+
+function extractAnthropicDeltas(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') return [];
+  const data = payload as { type?: string; delta?: { text?: string } };
+  if (data.type === 'content_block_delta' && typeof data.delta?.text === 'string') {
+    return [data.delta.text];
+  }
+  return [];
+}
+
+function extractOpenAIDeltas(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') return [];
+
+  const data = payload as {
+    choices?: Array<{ delta?: { content?: string | Array<{ text?: string }> } }>;
+  };
+
+  const deltas: string[] = [];
+  for (const choice of data.choices || []) {
+    const content = choice.delta?.content;
+    if (typeof content === 'string' && content) {
+      deltas.push(content);
+      continue;
     }
-    return { model: MODELS['sonnet-4.5'], modelTier: 'sonnet-4.5', budgetCap: 8000, rationaleTag: 'images-standard', complexityScore };
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (typeof part?.text === 'string' && part.text) {
+          deltas.push(part.text);
+        }
+      }
+    }
   }
 
-  if (complexityScore >= 75 || totalTokens > 100000) {
-    return { model: MODELS['opus-4.5'], modelTier: 'opus-4.5', budgetCap: 16000, rationaleTag: 'high-complexity', complexityScore };
+  return deltas;
+}
+
+function extractGoogleDeltas(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') return [];
+
+  const data = payload as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  };
+
+  const deltas: string[] = [];
+  for (const candidate of data.candidates || []) {
+    for (const part of candidate.content?.parts || []) {
+      if (typeof part?.text === 'string' && part.text) {
+        deltas.push(part.text);
+      }
+    }
   }
 
-  if (complexityScore <= 25 && queryTokens < 100 && totalTokens < 10000) {
-    return { model: MODELS['haiku-4.5'], modelTier: 'haiku-4.5', budgetCap: 4000, rationaleTag: 'low-complexity', complexityScore };
+  return deltas;
+}
+
+// ============================================================================
+// UPSTREAM CALLS
+// ============================================================================
+
+async function callAnthropic(
+  decision: RouteDecision,
+  allMessages: Message[],
+  images: ImageAttachment[],
+  signal: AbortSignal,
+): Promise<UpstreamCallResult> {
+  const anthropicResponse = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: decision.model,
+      max_tokens: decision.budgetCap,
+      messages: transformMessagesForClaude(allMessages, images),
+      stream: true,
+    }),
+    signal,
+  });
+
+  return {
+    response: anthropicResponse,
+    extractDeltas: extractAnthropicDeltas,
+  };
+}
+
+async function callOpenAI(
+  decision: RouteDecision,
+  allMessages: Message[],
+  images: ImageAttachment[],
+  signal: AbortSignal,
+): Promise<UpstreamCallResult> {
+  const messages = transformMessagesForOpenAI(allMessages, images);
+  const endpoint = 'https://api.openai.com/v1/chat/completions';
+
+  const doCall = (payload: Record<string, unknown>) =>
+    fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal,
+    });
+
+  let openaiResponse = await doCall({
+    model: decision.model,
+    messages,
+    stream: true,
+    max_completion_tokens: decision.budgetCap,
+  });
+
+  if (openaiResponse.status === 400) {
+    const bodyText = await openaiResponse.text();
+    if (bodyText.toLowerCase().includes('max_completion_tokens')) {
+      openaiResponse = await doCall({
+        model: decision.model,
+        messages,
+        stream: true,
+        max_tokens: decision.budgetCap,
+      });
+    } else {
+      openaiResponse = new Response(bodyText, {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
   }
 
-  return { model: MODELS['sonnet-4.5'], modelTier: 'sonnet-4.5', budgetCap: 8000, rationaleTag: 'default-balanced', complexityScore };
+  return {
+    response: openaiResponse,
+    extractDeltas: extractOpenAIDeltas,
+  };
+}
+
+async function callGoogle(
+  decision: RouteDecision,
+  allMessages: Message[],
+  images: ImageAttachment[],
+  signal: AbortSignal,
+): Promise<UpstreamCallResult> {
+  const endpoint =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(decision.model)}` +
+    `:streamGenerateContent?alt=sse&key=${encodeURIComponent(GOOGLE_API_KEY)}`;
+
+  const googleResponse = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      contents: transformMessagesForGoogle(allMessages, images),
+      generationConfig: {
+        maxOutputTokens: decision.budgetCap,
+      },
+    }),
+    signal,
+  });
+
+  return {
+    response: googleResponse,
+    extractDeltas: extractGoogleDeltas,
+  };
+}
+
+async function callProviderStream(
+  decision: RouteDecision,
+  allMessages: Message[],
+  images: ImageAttachment[],
+  signal: AbortSignal,
+): Promise<UpstreamCallResult> {
+  switch (decision.provider) {
+    case 'anthropic':
+      return await callAnthropic(decision, allMessages, images, signal);
+    case 'openai':
+      return await callOpenAI(decision, allMessages, images, signal);
+    case 'google':
+      return await callGoogle(decision, allMessages, images, signal);
+  }
+}
+
+// ============================================================================
+// STREAM NORMALIZATION
+// ============================================================================
+
+function tryParseJson(input: string): unknown | undefined {
+  try {
+    return JSON.parse(input);
+  } catch {
+    return undefined;
+  }
+}
+
+function createNormalizedProxyStream(params: {
+  upstreamBody: ReadableStream<Uint8Array>;
+  extractDeltas: (payload: unknown) => string[];
+  onDelta: (delta: string) => void;
+  onComplete: () => void;
+}): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let sseBuffer = '';
+  let completed = false;
+
+  const emitDelta = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    delta: string,
+  ) => {
+    if (!delta) return;
+    params.onDelta(delta);
+    controller.enqueue(
+      encoder.encode(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { text: delta } })}\n\n`),
+    );
+  };
+
+  const processDataLine = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    line: string,
+  ) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return;
+
+    const dataStr = trimmed.slice(5).trim();
+    if (!dataStr || dataStr === '[DONE]') return;
+
+    const payload = tryParseJson(dataStr);
+    if (!payload) return;
+
+    const deltas = params.extractDeltas(payload);
+    for (const delta of deltas) {
+      emitDelta(controller, delta);
+    }
+  };
+
+  const finalize = () => {
+    if (completed) return;
+    completed = true;
+    params.onComplete();
+  };
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      reader = params.upstreamBody.getReader();
+
+      (async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (!value) continue;
+
+            sseBuffer += decoder.decode(value, { stream: true });
+
+            const lines = sseBuffer.split('\n');
+            sseBuffer = lines.pop() ?? '';
+
+            for (const line of lines) {
+              processDataLine(controller, line);
+            }
+          }
+
+          const tail = sseBuffer.trim();
+          if (tail) processDataLine(controller, tail);
+
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        } catch (err) {
+          controller.error(err);
+        } finally {
+          try {
+            decoder.decode(new Uint8Array(), { stream: false });
+          } catch {
+            // ignore
+          }
+          finalize();
+        }
+      })();
+    },
+    async cancel(reason) {
+      try {
+        if (reader) await reader.cancel(reason);
+      } catch {
+        // ignore
+      } finally {
+        finalize();
+      }
+    },
+  });
 }
 
 // ============================================================================
@@ -282,28 +476,6 @@ function extractBearerToken(authHeader: string): string | null {
   return authHeader.substring(7);
 }
 
-function verifyJWT(token: string): { user_id: string; exp?: number } | null {
-  try {
-    const parts = token.split('.');
-    if (parts.length !== 3) return null;
-
-    const payload = JSON.parse(atob(parts[1]!.replace(/-/g, '+').replace(/_/g, '/')));
-
-    if (payload.exp && payload.exp < Date.now() / 1000) {
-      console.error('[JWT] Token expired');
-      return null;
-    }
-
-    const userId = payload.sub || payload.user_id;
-    if (!userId) return null;
-
-    return { user_id: userId, exp: payload.exp };
-  } catch (err) {
-    console.error('[JWT] Verification failed:', err);
-    return null;
-  }
-}
-
 // ============================================================================
 // DATABASE HELPERS
 // ============================================================================
@@ -311,7 +483,7 @@ function verifyJWT(token: string): { user_id: string; exp?: number } | null {
 async function validateConversation(
   supabase: ReturnType<typeof createClient>,
   conversationId: string,
-  userId: string
+  userId: string,
 ): Promise<{ valid: boolean; tokenCount: number }> {
   const { data: conv, error } = await supabase
     .from('conversations')
@@ -321,7 +493,7 @@ async function validateConversation(
 
   if (error || !conv) {
     const newConv: Conversation = { id: conversationId, user_id: userId, total_tokens: 0 };
-    await supabase.from('conversations').insert(newConv as any);
+    await supabase.from('conversations').insert(newConv as never);
     return { valid: true, tokenCount: 0 };
   }
 
@@ -337,7 +509,7 @@ function persistMessageAsync(
   content: string,
   tokenCount: number,
   modelUsed?: string,
-  imageUrl?: string
+  imageUrl?: string,
 ): void {
   (async () => {
     try {
@@ -347,15 +519,15 @@ function persistMessageAsync(
         content,
         token_count: tokenCount,
         model_used: modelUsed || undefined,
-        image_url: imageUrl || undefined
+        image_url: imageUrl || undefined,
       };
 
       await Promise.all([
-        supabase.from('messages').insert(messageRecord as any),
+        supabase.from('messages').insert(messageRecord as never),
         supabase.rpc('increment_token_count', {
           p_conversation_id: conversationId,
-          p_tokens: tokenCount
-        } as any)
+          p_tokens: tokenCount,
+        } as never),
       ]);
     } catch (err) {
       console.error('[DB] Persist failed:', err);
@@ -376,28 +548,69 @@ Deno.serve(async (req: Request) => {
   const timeoutId = setTimeout(() => controller.abort(), FUNCTION_TIMEOUT_MS);
 
   try {
+    const supabaseUrl = Deno.env.get('SUPABASE_URL');
+    const supabaseServiceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+    if (!supabaseUrl || !supabaseServiceRoleKey) {
+      return new Response(
+        JSON.stringify({ error: 'Server misconfigured: missing Supabase env vars' }),
+        {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        },
+      );
+    }
+
+    if (!hasAtLeastOneProviderConfigured()) {
+      return new Response(
+        JSON.stringify({
+          error:
+            'Server misconfigured: no provider credentials available. Configure ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY.',
+        }),
+        {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        },
+      );
+    }
+
     const authHeader = req.headers.get('Authorization');
     if (!authHeader) {
       return new Response(JSON.stringify({ error: 'Unauthorized: Missing Authorization header' }), {
-        status: 401, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 401,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
     const token = extractBearerToken(authHeader);
     if (!token) {
       return new Response(JSON.stringify({ error: 'Unauthorized: Invalid token format' }), {
-        status: 401, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 401,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
-    const jwtPayload = verifyJWT(token);
-    if (!jwtPayload) {
+    const supabaseClient = createClient(
+      supabaseUrl,
+      supabaseServiceRoleKey,
+      {
+        db: { schema: 'public' },
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false,
+        },
+      },
+    );
+
+    const { data: { user }, error: userError } = await supabaseClient.auth.getUser(token);
+    if (userError || !user) {
       return new Response(JSON.stringify({ error: 'Unauthorized: Invalid or expired token' }), {
-        status: 401, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 401,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
-    const userId = jwtPayload.user_id;
+    const userId = user.id;
 
     let body: {
       query?: string;
@@ -408,31 +621,32 @@ Deno.serve(async (req: Request) => {
       imageData?: string;
       mediaType?: string;
       imageStorageUrl?: string;
-      modelOverride?: ModelTier;
+      modelOverride?: string;
     };
 
     try {
       body = await req.json();
     } catch {
       return new Response(JSON.stringify({ error: 'Bad Request: Invalid JSON' }), {
-        status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 400,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
-    const { 
-      query: rawQuery, 
-      conversationId, 
-      platform = 'web', 
-      history = [], 
+    const {
+      query: rawQuery,
+      conversationId,
+      platform = 'web',
+      history = [],
       images,
       imageData,
-      mediaType, 
+      mediaType,
       imageStorageUrl,
-      modelOverride 
+      modelOverride,
     } = body;
 
     let imageAttachments: ImageAttachment[] = [];
-    
+
     if (images && images.length > 0) {
       imageAttachments = images;
     } else if (imageData) {
@@ -444,48 +658,46 @@ Deno.serve(async (req: Request) => {
 
     if (!query && !hasImages) {
       return new Response(JSON.stringify({ error: 'Bad Request: Missing query or image' }), {
-        status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 400,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
     if (!conversationId) {
       return new Response(JSON.stringify({ error: 'Bad Request: Missing conversationId' }), {
-        status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 400,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
     if (!query && hasImages) {
-      query = imageAttachments.length === 1 
-        ? 'Please analyze this image.' 
+      query = imageAttachments.length === 1
+        ? 'Please analyze this image.'
         : `Please analyze these ${imageAttachments.length} images.`;
     }
 
     if (query.length > MAX_QUERY_LENGTH) {
       return new Response(JSON.stringify({ error: 'Query exceeds maximum length' }), {
-        status: 400, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 400,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
     if (DEV_MODE) {
-      console.log(`[DEV] Request:`, {
+      console.log('[DEV] Request:', {
         userId: userId.slice(0, 8),
         conversationId: conversationId.slice(0, 8),
         imageCount: imageAttachments.length,
         queryLen: query.length,
-        modelOverride: modelOverride || 'auto'
+        modelOverride: modelOverride || 'auto',
       });
     }
 
-    const supabaseClient = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
-      { db: { schema: 'public' } }
-    );
-
-    const ownership = await validateConversation(supabaseClient as any, conversationId, userId);
+    const ownership = await validateConversation(supabaseClient as unknown as ReturnType<typeof createClient>, conversationId, userId);
     if (!ownership.valid) {
       return new Response(JSON.stringify({ error: 'Forbidden: Invalid conversation ownership' }), {
-        status: 403, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 403,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
@@ -495,13 +707,28 @@ Deno.serve(async (req: Request) => {
       platform,
       history,
       images: imageAttachments,
-      imageStorageUrl
     };
 
-    const decision = determineRoute(routerParams, modelOverride);
+    const normalizedOverride = normalizeModelOverride(modelOverride);
+    let decision = determineRoute(routerParams, normalizedOverride);
+
+    const availabilityCheck = normalizeDecisionAgainstProviderAvailability(decision, normalizedOverride);
+    if (availabilityCheck.error) {
+      return new Response(JSON.stringify({ error: availabilityCheck.error }), {
+        status: 400,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+      });
+    }
+    decision = availabilityCheck.decision;
 
     if (DEV_MODE) {
-      console.log(`[ROUTER] Score: ${decision.complexityScore}, Model: ${decision.modelTier}, Reason: ${decision.rationaleTag}, Images: ${imageAttachments.length}`);
+      console.log('[ROUTER] Decision:', {
+        provider: decision.provider,
+        modelTier: decision.modelTier,
+        modelId: decision.model,
+        score: decision.complexityScore,
+        rationale: decision.rationaleTag,
+      });
     }
 
     const userMsg: Message = {
@@ -510,64 +737,93 @@ Deno.serve(async (req: Request) => {
     };
 
     const allMessages = [...history, userMsg];
-    const claudeMessages = transformMessagesForClaude(allMessages, imageAttachments);
 
-    const anthropicResponse = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'x-api-key': ANTHROPIC_API_KEY!,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: decision.model,
-        max_tokens: decision.budgetCap,
-        messages: claudeMessages,
-        stream: true
-      }),
-      signal: controller.signal,
-    });
+    const upstream = await callProviderStream(decision, allMessages, imageAttachments, controller.signal);
 
-    if (!anthropicResponse.ok) {
-      const errorBody = await anthropicResponse.text();
-      console.error(`[Anthropic] Error ${anthropicResponse.status}:`, errorBody);
-      return new Response(JSON.stringify({ error: 'Upstream provider error', details: errorBody }), {
-        status: 502, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
-      });
+    if (!upstream.response.ok) {
+      const errorBody = await upstream.response.text();
+      console.error(`[Upstream:${decision.provider}] Error ${upstream.response.status}:`, errorBody);
+      return new Response(
+        JSON.stringify({
+          error: 'Upstream provider error',
+          provider: decision.provider,
+          details: errorBody,
+        }),
+        {
+          status: 502,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        },
+      );
     }
 
     const userTokenCount = countTokens(query) + countImageTokens(imageAttachments);
     persistMessageAsync(
-      supabaseClient as any,
+      supabaseClient as unknown as ReturnType<typeof createClient>,
       conversationId,
       'user',
       query,
       userTokenCount,
-      decision.model,
-      imageStorageUrl
+      `${decision.provider}:${decision.model}`,
+      imageStorageUrl,
     );
 
-    return new Response(anthropicResponse.body, {
+    if (!upstream.response.body) {
+      return new Response(JSON.stringify({ error: 'Upstream provider returned empty stream' }), {
+        status: 502,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+      });
+    }
+
+    let assistantText = '';
+
+    const proxyStream = createNormalizedProxyStream({
+      upstreamBody: upstream.response.body,
+      extractDeltas: upstream.extractDeltas,
+      onDelta: (delta) => {
+        assistantText += delta;
+      },
+      onComplete: () => {
+        const assistantTokenCount = countTokens(assistantText);
+        if (assistantText.trim()) {
+          persistMessageAsync(
+            supabaseClient as unknown as ReturnType<typeof createClient>,
+            conversationId,
+            'assistant',
+            assistantText,
+            assistantTokenCount,
+            `${decision.provider}:${decision.model}`,
+          );
+        }
+      },
+    });
+
+    return new Response(proxyStream, {
       headers: {
         ...CORS_HEADERS,
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'X-Claude-Model': decision.modelTier,
+        'X-Claude-Model-Id': decision.model,
+        'X-Router-Model': decision.modelTier,
+        'X-Router-Model-Id': decision.model,
+        'X-Provider': decision.provider,
+        'X-Model-Override': normalizedOverride || 'auto',
         'X-Router-Rationale': decision.rationaleTag,
-        'X-Complexity-Score': decision.complexityScore.toString()
-      }
+        'X-Complexity-Score': decision.complexityScore.toString(),
+      },
     });
-
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
       return new Response(JSON.stringify({ error: 'Request timeout' }), {
-        status: 504, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+        status: 504,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
 
     console.error('[Router] Critical error:', error);
     return new Response(JSON.stringify({ error: 'Internal server error' }), {
-      status: 500, headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' }
+      status: 500,
+      headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
     });
   } finally {
     clearTimeout(timeoutId);

@@ -8,7 +8,7 @@ import { ContextStatus } from './ContextStatus';
 import { FileUpload } from './FileUpload';
 import { askClaude, resetConversation } from '../smartFetch';
 import { uploadAttachment } from '../services/storageService';
-import type { Message, ClaudeModel, FileUploadPayload } from '../types';
+import type { Message, RouterModel, FileUploadPayload } from '../types';
 import type { User } from '@supabase/supabase-js';
 
 interface ChatInterfaceProps {
@@ -17,7 +17,7 @@ interface ChatInterfaceProps {
 }
 
 // Model configuration
-const MODEL_CONFIG: Record<ClaudeModel, { name: string; icon: string; description: string; color: string }> = {
+const MODEL_CONFIG: Record<RouterModel, { name: string; icon: string; description: string; color: string }> = {
   'opus-4.5': {
     name: 'Claude Opus 4.5',
     icon: '🧠',
@@ -35,6 +35,24 @@ const MODEL_CONFIG: Record<ClaudeModel, { name: string; icon: string; descriptio
     icon: '🚀',
     description: 'Fast & efficient',
     color: '#FFE66D'
+  },
+  'gpt-5-mini': {
+    name: 'GPT-5 mini',
+    icon: '🧩',
+    description: 'Low-latency general tasks',
+    color: '#F4A261'
+  },
+  'gemini-3-flash': {
+    name: 'Gemini 3 Flash',
+    icon: '✨',
+    description: 'Fast multimodal inference',
+    color: '#2A9D8F'
+  },
+  'gemini-3-pro': {
+    name: 'Gemini 3 Pro',
+    icon: '🔬',
+    description: 'Advanced multimodal reasoning',
+    color: '#1D3557'
   }
 };
 
@@ -42,11 +60,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [currentModel, setCurrentModel] = useState<ClaudeModel>('sonnet-4.5');
+  const [currentModel, setCurrentModel] = useState<RouterModel>('sonnet-4.5');
   const [currentComplexity, setCurrentComplexity] = useState<number>(50);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showModelSelector, setShowModelSelector] = useState(false);
-  const [manualModelOverride, setManualModelOverride] = useState<ClaudeModel | null>(null);
+  const [manualModelOverride, setManualModelOverride] = useState<RouterModel | null>(null);
   
   // ✅ FIX: Changed from single attachment to ARRAY of attachments
   const [draftAttachments, setDraftAttachments] = useState<FileUploadPayload[]>([]);
@@ -114,7 +132,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
   };
 
   // Handle model selection
-  const handleModelSelect = (model: ClaudeModel) => {
+  const handleModelSelect = (model: RouterModel) => {
     setManualModelOverride(model);
     setCurrentModel(model);
     setShowModelSelector(false);
@@ -203,7 +221,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
 
       if (!result) throw new Error('Failed to get response from router');
 
-      const { stream, model, complexityScore } = result;
+      const { stream, model, provider, complexityScore, modelId, modelOverride: appliedOverride } = result;
 
       // âœ… FIX: Only update model if no manual override is active
       // This prevents the backend response from overwriting the user's manual selection
@@ -220,6 +238,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         role: 'assistant',
         content: '',
         model,
+        provider,
+        modelId,
+        modelOverride: appliedOverride,
         timestamp: Date.now()
       }]);
 
@@ -358,7 +379,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
                     )}
                   </div>
                   <div className="model-options">
-                    {(Object.entries(MODEL_CONFIG) as [ClaudeModel, typeof MODEL_CONFIG['sonnet-4.5']][]).map(([key, config]) => (
+                    {(Object.entries(MODEL_CONFIG) as [RouterModel, typeof MODEL_CONFIG['sonnet-4.5']][]).map(([key, config]) => (
                       <button
                         key={key}
                         type="button"
@@ -445,9 +466,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           <div className="empty-state">
             <div className="empty-icon">🤖</div>
             <h2>Welcome, {getUserDisplay()}!</h2>
-            <p>The router will automatically select the best Claude model based on your query complexity</p>
+            <p>The router will automatically select the best model based on your query complexity</p>
             <div className="model-grid">
-              {(Object.entries(MODEL_CONFIG) as [ClaudeModel, typeof MODEL_CONFIG['sonnet-4.5']][]).map(([key, config]) => (
+              {(Object.entries(MODEL_CONFIG) as [RouterModel, typeof MODEL_CONFIG['sonnet-4.5']][]).map(([key, config]) => (
                 <div 
                   key={key} 
                   className="model-card"
@@ -470,10 +491,18 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
                 <div className="message-content">
                   <div className="message-header">
                     <span className="message-role">
-                      {msg.role === 'user' ? 'You' : 'Claude'}
+                      {msg.role === 'user' ? 'You' : 'Assistant'}
                     </span>
                     {msg.model && (
-                      <span className="message-model">{msg.model}</span>
+                      <span className="message-model" title={msg.modelId || msg.model}>
+                        {msg.modelId || msg.model}
+                      </span>
+                    )}
+                    {msg.provider && (
+                      <span className="message-model-override">{msg.provider}</span>
+                    )}
+                    {msg.modelOverride && msg.modelOverride !== 'auto' && (
+                      <span className="message-model-override">manual</span>
                     )}
                     <span className="message-time">
                       {new Date(msg.timestamp).toLocaleTimeString()}
@@ -843,6 +872,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         .message-header { display: flex; align-items: center; gap: 0.75rem; font-size: 0.8rem; }
         .message-role { font-weight: 600; color: #fff; }
         .message-model { padding: 0.125rem 0.5rem; background: rgba(255, 255, 255, 0.05); border-radius: 0.25rem; font-size: 0.7rem; text-transform: uppercase; }
+        .message-model-override {
+          padding: 0.125rem 0.4rem;
+          background: rgba(255, 107, 107, 0.15);
+          border: 1px solid rgba(255, 107, 107, 0.4);
+          border-radius: 0.25rem;
+          font-size: 0.65rem;
+          text-transform: uppercase;
+          color: #FF6B6B;
+        }
         .message-time { color: rgba(255, 255, 255, 0.4); margin-left: auto; }
 
         .message-image-container { margin: 0.5rem 0; max-width: 300px; }
@@ -953,6 +991,13 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         @keyframes pulse { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(1.1); opacity: 0; } }
 
         @media (max-width: 768px) {
+          .chat-header { padding: 0.75rem 1rem; }
+          .header-content { flex-direction: column; align-items: stretch; }
+          .header-actions { width: 100%; justify-content: space-between; flex-wrap: wrap; }
+          .model-selector-container { flex: 1 1 100%; }
+          .model-indicator-button { width: 100%; justify-content: space-between; }
+          .user-menu-container { margin-left: auto; flex-shrink: 0; }
+          .model-dropdown { right: 0; left: 0; width: calc(100vw - 2rem); max-width: 360px; }
           .model-grid { grid-template-columns: 1fr; max-width: 200px; }
           .model-info { display: none; }
         }

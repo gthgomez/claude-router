@@ -1,12 +1,17 @@
 // src/types.ts
 
 export type ClaudeModel = 'opus-4.5' | 'sonnet-4.5' | 'haiku-4.5';
+export type RouterModel = ClaudeModel | 'gpt-5-mini' | 'gemini-3-flash' | 'gemini-3-pro';
+export type RouterProvider = 'anthropic' | 'openai' | 'google';
 
 export interface Message {
   role: 'user' | 'assistant';
   content: string | any[]; // Supports multimodal content
   timestamp: number;
-  model?: ClaudeModel;
+  model?: RouterModel;
+  provider?: RouterProvider;
+  modelId?: string;
+  modelOverride?: string;
   imageData?: string;            // Base64 image data (first image for display)
   mediaType?: string;            // MIME type
   imageStorageUrl?: string;      // Supabase storage URL
@@ -47,5 +52,5 @@ export interface RouterPayload {
   imageData?: string;             // Legacy single image
   mediaType?: string;
   imageStorageUrl?: string;
-  modelOverride?: ClaudeModel;
+  modelOverride?: RouterModel;
 }

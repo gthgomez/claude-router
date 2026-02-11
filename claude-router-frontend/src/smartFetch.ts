@@ -2,12 +2,43 @@
 // FIXED: Supports multiple file attachments in a single message
 
 import { supabase } from './lib/supabase';
-import type { Message, ClaudeModel, FileUploadPayload } from './types';
+import { CONFIG } from './config';
+import type { Message, RouterModel, RouterProvider, FileUploadPayload } from './types';
+
+function base64UrlDecode(input: string): string {
+  const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=');
+  return atob(padded);
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  const payloadPart = parts[1];
+  if (!payloadPart) return null;
+  try {
+    const json = base64UrlDecode(payloadPart);
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function hostOf(value: string): string {
+  try {
+    return new URL(value).host;
+  } catch {
+    return '';
+  }
+}
 
 /**
  * Generates a valid UUID v4
  */
 function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = Math.random() * 16 | 0;
     const v = c === 'x' ? r : (r & 0x3 | 0x8);
@@ -68,7 +99,7 @@ function getEnvVar(key: string): string {
  * Gets the current user's access token from Supabase session
  * Includes automatic token refresh if expired or expiring soon
  */
-async function getAccessToken(): Promise<string> {
+async function getAccessToken(forceRefresh = false): Promise<string> {
   const { data: { session }, error } = await supabase.auth.getSession();
   
   if (error) {
@@ -79,26 +110,53 @@ async function getAccessToken(): Promise<string> {
   if (!session?.access_token) {
     throw new Error('No active session. Please sign in.');
   }
+
+  const expectedHost = hostOf(CONFIG.SUPABASE_URL);
+  const payload = decodeJwtPayload(session.access_token);
+  const issuer = typeof payload?.iss === 'string' ? payload.iss : '';
+  const issuerHost = issuer ? hostOf(issuer) : '';
+
+  if (expectedHost && issuerHost && expectedHost !== issuerHost) {
+    console.error('[smartFetch] Token issuer mismatch:', { issuerHost, expectedHost });
+    await supabase.auth.signOut();
+    throw new Error(
+      `Session token is for ${issuerHost}, but app is configured for ${expectedHost}. ` +
+      'Clear site data and sign in again.'
+    );
+  }
   
+  let shouldRefresh = forceRefresh;
+
   // Check if token is expired or about to expire (less than 60 seconds remaining)
   if (session.expires_at) {
     const expiresIn = session.expires_at * 1000 - Date.now();
-    
     if (expiresIn < 60000) {
-      console.log('[smartFetch] Token expiring soon, refreshing...');
-      
-      const { data: { session: refreshedSession }, error: refreshError } = await supabase.auth.refreshSession();
-      
-      if (refreshError || !refreshedSession?.access_token) {
-        console.error('[smartFetch] Token refresh failed:', refreshError);
-        throw new Error('Session expired. Please sign in again.');
-      }
-      
-      console.log('[smartFetch] Token refreshed successfully');
-      return refreshedSession.access_token;
+      shouldRefresh = true;
     }
   }
-  
+
+  if (!shouldRefresh) {
+    const { error: userError } = await supabase.auth.getUser();
+    if (userError) {
+      console.warn('[smartFetch] Session validation failed, refreshing token:', userError.message);
+      shouldRefresh = true;
+    }
+  }
+
+  if (shouldRefresh) {
+    console.log('[smartFetch] Refreshing session...');
+    const { data: { session: refreshedSession }, error: refreshError } = await supabase.auth.refreshSession();
+
+    if (refreshError || !refreshedSession?.access_token) {
+      console.error('[smartFetch] Token refresh failed:', refreshError);
+      await supabase.auth.signOut();
+      throw new Error('Session expired. Please sign in again.');
+    }
+
+    console.log('[smartFetch] Token refreshed successfully');
+    return refreshedSession.access_token;
+  }
+
   return session.access_token;
 }
 
@@ -116,15 +174,21 @@ export async function askClaude(
   query: string,
   history: Message[] = [],
   attachments: FileUploadPayload[] = [], // ✅ Changed from single to array
-  modelOverride?: ClaudeModel | null
+  modelOverride?: RouterModel | null
 ): Promise<{
   stream: ReadableStream<Uint8Array>;
-  model: ClaudeModel;
+  model: RouterModel;
+  provider?: RouterProvider;
   complexityScore: number;
+  modelId?: string;
+  modelOverride?: string;
 } | null> {
   try {
-    const routerEndpoint = getEnvVar('VITE_ROUTER_ENDPOINT');
-    const accessToken = await getAccessToken();
+    const routerEndpoint = CONFIG.ROUTER_ENDPOINT || getEnvVar('VITE_ROUTER_ENDPOINT');
+    if (!routerEndpoint) {
+      throw new Error('Missing VITE_ROUTER_ENDPOINT. Check your Vercel env vars.');
+    }
+    let accessToken = await getAccessToken();
     const conversationId = getConversationId();
     
     // ✅ FIX: Build arrays for multiple images and text file content
@@ -176,21 +240,43 @@ export async function askClaude(
       modelOverride: modelOverride || 'auto'
     });
 
-    const response = await fetch(routerEndpoint, {
+    const doFetch = (token: string) => fetch(routerEndpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${accessToken}`
+        'Authorization': `Bearer ${token}`,
+        ...(CONFIG.SUPABASE_ANON_KEY ? { 'apikey': CONFIG.SUPABASE_ANON_KEY } : {})
       },
       body: JSON.stringify(payload)
     });
+
+    let response = await doFetch(accessToken);
 
     if (!response.ok) {
       const errorText = await response.text();
       console.error('[smartFetch] Router Error:', response.status, errorText);
       
       if (response.status === 401) {
-        throw new Error('Session expired. Please sign in again.');
+        if (errorText.includes('Invalid JWT')) {
+          console.warn('[smartFetch] Invalid JWT detected, attempting refresh + retry');
+          try {
+            accessToken = await getAccessToken(true);
+            response = await doFetch(accessToken);
+            if (response.ok) {
+              // continue to success path below
+            } else {
+              const retryText = await response.text();
+              console.error('[smartFetch] Router Error (after refresh):', response.status, retryText);
+              await supabase.auth.signOut();
+              throw new Error('Invalid JWT. Clear site data and sign in again.');
+            }
+          } catch (refreshErr) {
+            await supabase.auth.signOut();
+            throw refreshErr;
+          }
+        } else {
+          throw new Error('Session expired. Please sign in again.');
+        }
       }
       
       try {
@@ -205,13 +291,23 @@ export async function askClaude(
     }
 
     // Extract model info from headers
-    const modelHeader = response.headers.get('X-Claude-Model') as ClaudeModel || 'sonnet-4.5';
+    const modelHeader = (
+      response.headers.get('X-Router-Model') ||
+      response.headers.get('X-Claude-Model') ||
+      'sonnet-4.5'
+    ) as RouterModel;
+    const modelIdHeader = response.headers.get('X-Router-Model-Id') || response.headers.get('X-Claude-Model-Id') || '';
+    const providerHeader = response.headers.get('X-Provider') as RouterProvider | null;
+    const overrideHeader = response.headers.get('X-Model-Override') || '';
     const complexityHeader = response.headers.get('X-Complexity-Score');
     const rationaleHeader = response.headers.get('X-Router-Rationale');
     const complexityScore = complexityHeader ? parseInt(complexityHeader, 10) : 50;
 
     console.log('[smartFetch] Response:', {
       model: modelHeader,
+      provider: providerHeader || undefined,
+      modelId: modelIdHeader,
+      override: overrideHeader,
       complexity: complexityScore,
       rationale: rationaleHeader,
       status: response.status
@@ -224,7 +320,10 @@ export async function askClaude(
     return {
       stream: response.body,
       model: modelHeader,
-      complexityScore
+      provider: providerHeader || undefined,
+      complexityScore,
+      modelId: modelIdHeader || undefined,
+      modelOverride: overrideHeader || undefined
     };
   } catch (error) {
     console.error('[smartFetch] Error:', error);
@@ -239,8 +338,8 @@ export async function askClaudeSync(
   query: string,
   history: Message[] = [],
   attachments: FileUploadPayload[] = [],
-  modelOverride?: ClaudeModel | null
-): Promise<{ content: string; model: ClaudeModel; complexityScore: number } | null> {
+  modelOverride?: RouterModel | null
+): Promise<{ content: string; model: RouterModel; provider?: RouterProvider; complexityScore: number; modelId?: string; modelOverride?: string } | null> {
   const result = await askClaude(query, history, attachments, modelOverride);
   if (!result) return null;
 
@@ -258,7 +357,10 @@ export async function askClaudeSync(
     return {
       content,
       model: result.model,
-      complexityScore: result.complexityScore
+      provider: result.provider,
+      complexityScore: result.complexityScore,
+      modelId: result.modelId,
+      modelOverride: result.modelOverride
     };
   } catch (error) {
     console.error('[smartFetch] Stream reading error:', error);
