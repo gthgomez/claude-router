@@ -5,17 +5,17 @@ import {
   countImageTokens,
   countTokens,
   determineRoute,
-  MODEL_REGISTRY,
-  normalizeModelOverride,
-  transformMessagesForClaude,
-  transformMessagesForGoogle,
-  transformMessagesForOpenAI,
   type ImageAttachment,
   type Message,
+  MODEL_REGISTRY,
+  normalizeModelOverride,
   type Provider,
   type RouteDecision,
   type RouterModel,
   type RouterParams,
+  transformMessagesForClaude,
+  transformMessagesForGoogle,
+  transformMessagesForOpenAI,
 } from './router_logic.ts';
 
 // ============================================================================
@@ -44,12 +44,15 @@ interface UpstreamCallResult {
   response: Response;
   extractDeltas: (payload: unknown) => string[];
   effectiveModelId: string;
+  effectiveGeminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
 }
 
 interface GoogleModelRecord {
   name: string;
   supportedGenerationMethods: string[];
 }
+
+type GeminiFlashThinkingLevel = 'low' | 'high';
 
 // ============================================================================
 // CONSTANTS & CONFIGURATION
@@ -60,7 +63,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
   'Access-Control-Expose-Headers':
-    'X-Claude-Model, X-Claude-Model-Id, X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score',
+    'X-Claude-Model, X-Claude-Model-Id, X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level',
 };
 
 const FUNCTION_TIMEOUT_MS = 55000;
@@ -126,13 +129,23 @@ function hasAtLeastOneProviderConfigured(): boolean {
 }
 
 function fallbackModel(): RouterModel | undefined {
-  if (isProviderReady('anthropic')) return 'sonnet-4.5';
-  if (isProviderReady('openai')) return 'gpt-5-mini';
   if (isProviderReady('google')) return 'gemini-3-flash';
+  if (isProviderReady('openai')) return 'gpt-5-mini';
+  if (isProviderReady('anthropic')) return 'sonnet-4.5';
   return undefined;
 }
 
-function decisionFromModel(modelTier: RouterModel, complexityScore: number, rationaleTag: string): RouteDecision {
+function normalizeGeminiFlashThinkingLevel(input?: string): GeminiFlashThinkingLevel {
+  const normalized = String(input || '').trim().toLowerCase();
+  if (normalized === 'low') return 'low';
+  return 'high';
+}
+
+function decisionFromModel(
+  modelTier: RouterModel,
+  complexityScore: number,
+  rationaleTag: string,
+): RouteDecision {
   const modelCfg = MODEL_REGISTRY[modelTier];
   return {
     provider: modelCfg.provider,
@@ -155,8 +168,7 @@ function normalizeDecisionAgainstProviderAvailability(
   if (normalizedOverride) {
     return {
       decision,
-      error:
-        `Requested model '${normalizedOverride}' requires provider '${decision.provider}', ` +
+      error: `Requested model '${normalizedOverride}' requires provider '${decision.provider}', ` +
         `but it is not configured or enabled on the server.`,
     };
   }
@@ -252,8 +264,9 @@ async function listGoogleModels(signal: AbortSignal): Promise<GoogleModelRecord[
     return googleModelsCache.models;
   }
 
-  const endpoint =
-    `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(GOOGLE_API_KEY)}`;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models?key=${
+    encodeURIComponent(GOOGLE_API_KEY)
+  }`;
   const response = await fetch(endpoint, { method: 'GET', signal });
   const responseText = await response.text();
 
@@ -426,6 +439,7 @@ async function callGoogle(
   allMessages: Message[],
   images: ImageAttachment[],
   signal: AbortSignal,
+  geminiFlashThinkingLevel: GeminiFlashThinkingLevel,
 ): Promise<UpstreamCallResult> {
   const resolvedModel = await resolveGoogleModelAlias(decision.model, signal);
 
@@ -433,25 +447,64 @@ async function callGoogle(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(resolvedModel)}` +
     `:streamGenerateContent?alt=sse&key=${encodeURIComponent(GOOGLE_API_KEY)}`;
 
-  const googleResponse = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      contents: transformMessagesForGoogle(allMessages, images),
-      generationConfig: {
-        maxOutputTokens: decision.budgetCap,
-      },
-    }),
-    signal,
-  });
+  const isGeminiFlash = decision.modelTier === 'gemini-3-flash';
+  const toApiThinkingLevel = geminiFlashThinkingLevel === 'low' ? 'LOW' : 'HIGH';
 
-  return {
+  const doCall = (includeThinkingConfig: boolean) =>
+    fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        contents: transformMessagesForGoogle(allMessages, images),
+        generationConfig: {
+          maxOutputTokens: decision.budgetCap,
+          ...(includeThinkingConfig && isGeminiFlash
+            ? {
+              thinkingConfig: {
+                thinkingLevel: toApiThinkingLevel,
+              },
+            }
+            : {}),
+        },
+      }),
+      signal,
+    });
+
+  let effectiveGeminiFlashThinkingLevel: GeminiFlashThinkingLevel | undefined = isGeminiFlash
+    ? geminiFlashThinkingLevel
+    : undefined;
+
+  let googleResponse = await doCall(isGeminiFlash);
+
+  if (googleResponse.status === 400 && isGeminiFlash) {
+    const responseText = await googleResponse.text();
+    const lowered = responseText.toLowerCase();
+    const looksLikeThinkingConfigError = lowered.includes('thinking') ||
+      lowered.includes('thinkingconfig') ||
+      lowered.includes('thinking_level');
+
+    if (looksLikeThinkingConfigError) {
+      googleResponse = await doCall(false);
+      effectiveGeminiFlashThinkingLevel = undefined;
+    } else {
+      googleResponse = new Response(responseText, {
+        status: 400,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+  }
+
+  const result: UpstreamCallResult = {
     response: googleResponse,
     extractDeltas: extractGoogleDeltas,
     effectiveModelId: resolvedModel,
   };
+  if (effectiveGeminiFlashThinkingLevel) {
+    result.effectiveGeminiFlashThinkingLevel = effectiveGeminiFlashThinkingLevel;
+  }
+  return result;
 }
 
 async function callProviderStream(
@@ -459,6 +512,7 @@ async function callProviderStream(
   allMessages: Message[],
   images: ImageAttachment[],
   signal: AbortSignal,
+  geminiFlashThinkingLevel: GeminiFlashThinkingLevel,
 ): Promise<UpstreamCallResult> {
   switch (decision.provider) {
     case 'anthropic':
@@ -466,7 +520,7 @@ async function callProviderStream(
     case 'openai':
       return await callOpenAI(decision, allMessages, images, signal);
     case 'google':
-      return await callGoogle(decision, allMessages, images, signal);
+      return await callGoogle(decision, allMessages, images, signal, geminiFlashThinkingLevel);
   }
 }
 
@@ -501,7 +555,9 @@ function createNormalizedProxyStream(params: {
     if (!delta) return;
     params.onDelta(delta);
     controller.enqueue(
-      encoder.encode(`data: ${JSON.stringify({ type: 'content_block_delta', delta: { text: delta } })}\n\n`),
+      encoder.encode(
+        `data: ${JSON.stringify({ type: 'content_block_delta', delta: { text: delta } })}\n\n`,
+      ),
     );
   };
 
@@ -735,6 +791,7 @@ Deno.serve(async (req: Request) => {
       mediaType?: string;
       imageStorageUrl?: string;
       modelOverride?: string;
+      geminiFlashThinkingLevel?: string;
     };
 
     try {
@@ -756,7 +813,12 @@ Deno.serve(async (req: Request) => {
       mediaType,
       imageStorageUrl,
       modelOverride,
+      geminiFlashThinkingLevel,
     } = body;
+
+    const normalizedGeminiFlashThinkingLevel = normalizeGeminiFlashThinkingLevel(
+      geminiFlashThinkingLevel,
+    );
 
     let imageAttachments: ImageAttachment[] = [];
 
@@ -803,10 +865,15 @@ Deno.serve(async (req: Request) => {
         imageCount: imageAttachments.length,
         queryLen: query.length,
         modelOverride: modelOverride || 'auto',
+        geminiFlashThinkingLevel: normalizedGeminiFlashThinkingLevel,
       });
     }
 
-    const ownership = await validateConversation(supabaseClient as unknown as ReturnType<typeof createClient>, conversationId, userId);
+    const ownership = await validateConversation(
+      supabaseClient as unknown as ReturnType<typeof createClient>,
+      conversationId,
+      userId,
+    );
     if (!ownership.valid) {
       return new Response(JSON.stringify({ error: 'Forbidden: Invalid conversation ownership' }), {
         status: 403,
@@ -825,7 +892,10 @@ Deno.serve(async (req: Request) => {
     const normalizedOverride = normalizeModelOverride(modelOverride);
     let decision = determineRoute(routerParams, normalizedOverride);
 
-    const availabilityCheck = normalizeDecisionAgainstProviderAvailability(decision, normalizedOverride);
+    const availabilityCheck = normalizeDecisionAgainstProviderAvailability(
+      decision,
+      normalizedOverride,
+    );
     if (availabilityCheck.error) {
       return new Response(JSON.stringify({ error: availabilityCheck.error }), {
         status: 400,
@@ -853,9 +923,17 @@ Deno.serve(async (req: Request) => {
 
     let upstream: UpstreamCallResult;
     try {
-      upstream = await callProviderStream(decision, allMessages, imageAttachments, controller.signal);
+      upstream = await callProviderStream(
+        decision,
+        allMessages,
+        imageAttachments,
+        controller.signal,
+        normalizedGeminiFlashThinkingLevel,
+      );
     } catch (upstreamError) {
-      const message = upstreamError instanceof Error ? upstreamError.message : String(upstreamError);
+      const message = upstreamError instanceof Error
+        ? upstreamError.message
+        : String(upstreamError);
       return new Response(
         JSON.stringify({
           error: 'Upstream provider error',
@@ -871,7 +949,10 @@ Deno.serve(async (req: Request) => {
 
     if (!upstream.response.ok) {
       const errorBody = await upstream.response.text();
-      console.error(`[Upstream:${decision.provider}] Error ${upstream.response.status}:`, errorBody);
+      console.error(
+        `[Upstream:${decision.provider}] Error ${upstream.response.status}:`,
+        errorBody,
+      );
       return new Response(
         JSON.stringify({
           error: 'Upstream provider error',
@@ -941,6 +1022,7 @@ Deno.serve(async (req: Request) => {
         'X-Model-Override': normalizedOverride || 'auto',
         'X-Router-Rationale': decision.rationaleTag,
         'X-Complexity-Score': decision.complexityScore.toString(),
+        'X-Gemini-Thinking-Level': upstream.effectiveGeminiFlashThinkingLevel || 'n/a',
       },
     });
   } catch (error) {

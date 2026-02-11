@@ -9,10 +9,22 @@ function params(
   return { userQuery, currentSessionTokens, platform, history: [] };
 }
 
-Deno.test('Router: defaults to Sonnet for normal web queries', () => {
+Deno.test('Router: defaults to Gemini Flash for normal web queries', () => {
   const decision = determineRoute(params('Hello, world!', 0, 'web'));
+  assertEquals(decision.modelTier, 'gemini-3-flash');
+  assertEquals(decision.rationaleTag, 'default-cost-optimized');
+});
+
+Deno.test('Router: code-heavy complex queries prefer Sonnet for quality', () => {
+  const decision = determineRoute(
+    params(
+      'Please debug this TypeScript function and explain the stack trace: ```ts const x = () => {}; ```',
+      0,
+      'web',
+    ),
+  );
   assertEquals(decision.modelTier, 'sonnet-4.5');
-  assertEquals(decision.rationaleTag, 'default-balanced');
+  assertEquals(decision.rationaleTag, 'code-quality-priority');
 });
 
 Deno.test('Router: routes to Opus for very large context', () => {

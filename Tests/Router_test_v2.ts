@@ -2,8 +2,8 @@ import { assertEquals } from 'https://deno.land/std@0.168.0/testing/asserts.ts';
 import {
   countTokens,
   determineRoute,
-  normalizeModelOverride,
   type ImageAttachment,
+  normalizeModelOverride,
   type RouterParams,
 } from '../supabase/functions/router/router_logic.ts';
 
@@ -56,6 +56,22 @@ Deno.test('determineRoute: low complexity can trigger Haiku', () => {
   const decision = determineRoute(params('Quick define.', 0, 'web'));
   assertEquals(decision.modelTier, 'haiku-4.5');
   assertEquals(decision.rationaleTag, 'low-complexity');
+});
+
+Deno.test('determineRoute: default web query routes to Gemini Flash', () => {
+  const decision = determineRoute(params('Give me a summary of this release.'));
+  assertEquals(decision.modelTier, 'gemini-3-flash');
+  assertEquals(decision.rationaleTag, 'default-cost-optimized');
+});
+
+Deno.test('determineRoute: code-heavy complex query routes to Sonnet', () => {
+  const decision = determineRoute(
+    params(
+      'Please debug this TypeScript code and explain why it crashes: ```ts function test(){return;} ```',
+    ),
+  );
+  assertEquals(decision.modelTier, 'sonnet-4.5');
+  assertEquals(decision.rationaleTag, 'code-quality-priority');
 });
 
 Deno.test('countTokens: non-empty returns positive', () => {

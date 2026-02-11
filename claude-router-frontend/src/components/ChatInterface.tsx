@@ -8,7 +8,12 @@ import { ContextStatus } from './ContextStatus';
 import { FileUpload } from './FileUpload';
 import { askClaude, resetConversation } from '../smartFetch';
 import { uploadAttachment } from '../services/storageService';
-import type { Message, RouterModel, FileUploadPayload } from '../types';
+import type {
+  FileUploadPayload,
+  GeminiFlashThinkingLevel,
+  Message,
+  RouterModel,
+} from '../types';
 import { MODEL_CATALOG, MODEL_ORDER } from '../modelCatalog';
 import type { User } from '@supabase/supabase-js';
 
@@ -23,11 +28,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
   const [input, setInput] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [currentModel, setCurrentModel] = useState<RouterModel>('sonnet-4.5');
+  const [currentModel, setCurrentModel] = useState<RouterModel>('gemini-3-flash');
   const [currentComplexity, setCurrentComplexity] = useState<number>(50);
   const [showUserMenu, setShowUserMenu] = useState(false);
   const [showModelSelector, setShowModelSelector] = useState(false);
   const [manualModelOverride, setManualModelOverride] = useState<RouterModel | null>(null);
+  const [geminiFlashThinkingLevel, setGeminiFlashThinkingLevel] = useState<GeminiFlashThinkingLevel>('high');
   
   // ✅ FIX: Changed from single attachment to ARRAY of attachments
   const [draftAttachments, setDraftAttachments] = useState<FileUploadPayload[]>([]);
@@ -179,12 +185,21 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         queryText,
         messages,
         attachmentsToProcess, // Now passing array!
-        manualModelOverride
+        manualModelOverride,
+        geminiFlashThinkingLevel,
       );
 
       if (!result) throw new Error('Failed to get response from router');
 
-      const { stream, model, provider, complexityScore, modelId, modelOverride: appliedOverride } = result;
+      const {
+        stream,
+        model,
+        provider,
+        complexityScore,
+        modelId,
+        modelOverride: appliedOverride,
+        geminiFlashThinkingLevel: appliedGeminiThinkingLevel,
+      } = result;
 
       // âœ… FIX: Only update model if no manual override is active
       // This prevents the backend response from overwriting the user's manual selection
@@ -204,6 +219,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         provider,
         modelId,
         modelOverride: appliedOverride,
+        geminiFlashThinkingLevel: appliedGeminiThinkingLevel,
         timestamp: Date.now()
       }]);
 
@@ -268,10 +284,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
     if (confirm('Reset conversation? This will clear all messages.')) {
       setMessages([]);
       resetConversation();
-      setCurrentModel('sonnet-4.5');
+      setCurrentModel('gemini-3-flash');
       setCurrentComplexity(50);
       setDraftAttachments([]);
       setManualModelOverride(null);
+      setGeminiFlashThinkingLevel('high');
     }
   };
 
@@ -363,6 +380,26 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
                   </div>
                 </div>
               )}
+            </div>
+
+            <div className="thinking-toggle-container" title="Applies when Gemini Flash is selected">
+              <span className="thinking-toggle-label">Flash Thinking</span>
+              <div className="thinking-toggle-buttons">
+                <button
+                  type="button"
+                  className={`thinking-toggle-button ${geminiFlashThinkingLevel === 'low' ? 'active' : ''}`}
+                  onClick={() => setGeminiFlashThinkingLevel('low')}
+                >
+                  Low
+                </button>
+                <button
+                  type="button"
+                  className={`thinking-toggle-button ${geminiFlashThinkingLevel === 'high' ? 'active' : ''}`}
+                  onClick={() => setGeminiFlashThinkingLevel('high')}
+                >
+                  High
+                </button>
+              </div>
             </div>
 
             <button
@@ -472,6 +509,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
                     )}
                     {msg.modelOverride && msg.modelOverride !== 'auto' && (
                       <span className="message-model-override">manual</span>
+                    )}
+                    {msg.geminiFlashThinkingLevel && (
+                      <span className="message-model-override">thinking:{msg.geminiFlashThinkingLevel}</span>
                     )}
                     <span className="message-time">
                       {new Date(msg.timestamp).toLocaleTimeString()}
@@ -656,6 +696,44 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         .header-button:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
 
         .model-selector-container { position: relative; }
+
+        .thinking-toggle-container {
+          display: flex;
+          align-items: center;
+          gap: 0.5rem;
+          padding: 0.35rem 0.6rem;
+          border-radius: 0.5rem;
+          background: rgba(255, 255, 255, 0.04);
+          border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .thinking-toggle-label {
+          font-size: 0.68rem;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: rgba(255, 255, 255, 0.65);
+        }
+
+        .thinking-toggle-buttons {
+          display: flex;
+          gap: 0.3rem;
+        }
+
+        .thinking-toggle-button {
+          border: 1px solid rgba(255, 255, 255, 0.16);
+          background: rgba(255, 255, 255, 0.04);
+          color: rgba(255, 255, 255, 0.7);
+          border-radius: 0.4rem;
+          padding: 0.22rem 0.5rem;
+          font-size: 0.72rem;
+          cursor: pointer;
+        }
+
+        .thinking-toggle-button.active {
+          border-color: rgba(78, 205, 196, 0.6);
+          background: rgba(78, 205, 196, 0.2);
+          color: #4ECDC4;
+        }
 
         .model-indicator-button {
           display: flex; align-items: center; gap: 0.75rem;
@@ -964,6 +1042,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           .header-content { flex-direction: column; align-items: stretch; }
           .header-actions { width: 100%; justify-content: space-between; flex-wrap: wrap; }
           .model-selector-container { flex: 1 1 100%; }
+          .thinking-toggle-container { flex: 1 1 100%; justify-content: space-between; }
           .model-indicator-button { width: 100%; justify-content: space-between; }
           .user-menu-container { margin-left: auto; flex-shrink: 0; }
           .model-dropdown { right: 0; left: 0; width: calc(100vw - 2rem); max-width: 360px; }

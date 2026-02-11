@@ -428,7 +428,11 @@ function analyzeComplexity(params: RouterParams): number {
   return Math.max(0, Math.min(100, score));
 }
 
-function buildDecision(modelTier: RouterModel, rationaleTag: string, complexityScore: number): RouteDecision {
+function buildDecision(
+  modelTier: RouterModel,
+  rationaleTag: string,
+  complexityScore: number,
+): RouteDecision {
   const config = MODEL_REGISTRY[modelTier];
   return {
     provider: config.provider,
@@ -444,11 +448,22 @@ export function isClaudeModel(modelTier: RouterModel): boolean {
   return MODEL_REGISTRY[modelTier].provider === 'anthropic';
 }
 
+function isCodeHeavyQuery(query: string): boolean {
+  const codeIndicators = [
+    /```/,
+    /\b(function|const|let|var|class|def|import|export|typescript|javascript|python|sql)\b/i,
+    /[{}\[\]();]/,
+    /\b(error|bug|fix|debug|trace|stack|exception|compile)\b/i,
+  ];
+  return codeIndicators.some((pattern) => pattern.test(query));
+}
+
 export function determineRoute(params: RouterParams, modelOverride?: RouterModel): RouteDecision {
   const hasImages = params.images && params.images.length > 0;
   const complexityScore = analyzeComplexity(params);
   const queryTokens = countTokens(params.userQuery) + countImageTokens(params.images);
   const totalTokens = params.currentSessionTokens + queryTokens;
+  const codeHeavy = isCodeHeavyQuery(params.userQuery);
 
   if (modelOverride && MODEL_REGISTRY[modelOverride]) {
     return buildDecision(modelOverride, 'manual-override', complexityScore);
@@ -461,7 +476,11 @@ export function determineRoute(params: RouterParams, modelOverride?: RouterModel
     if (complexityScore <= 30 && totalTokens < 30000) {
       return buildDecision('gemini-3-flash', 'images-fast', complexityScore);
     }
-    return buildDecision('sonnet-4.5', 'images-standard', complexityScore);
+    return buildDecision('gemini-3-flash', 'images-default-flash', complexityScore);
+  }
+
+  if (codeHeavy && complexityScore >= 45 && totalTokens < 90000) {
+    return buildDecision('sonnet-4.5', 'code-quality-priority', complexityScore);
   }
 
   if (complexityScore >= 80 || totalTokens > 100000) {
@@ -476,5 +495,5 @@ export function determineRoute(params: RouterParams, modelOverride?: RouterModel
     return buildDecision('haiku-4.5', 'low-complexity', complexityScore);
   }
 
-  return buildDecision('sonnet-4.5', 'default-balanced', complexityScore);
+  return buildDecision('gemini-3-flash', 'default-cost-optimized', complexityScore);
 }

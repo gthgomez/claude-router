@@ -3,6 +3,7 @@
 export type ClaudeModel = 'opus-4.5' | 'sonnet-4.5' | 'haiku-4.5';
 export type RouterModel = ClaudeModel | 'gpt-5-mini' | 'gemini-3-flash' | 'gemini-3-pro';
 export type RouterProvider = 'anthropic' | 'openai' | 'google';
+export type GeminiFlashThinkingLevel = 'low' | 'high';
 
 export interface Message {
   role: 'user' | 'assistant';
@@ -12,6 +13,7 @@ export interface Message {
   provider?: RouterProvider;
   modelId?: string;
   modelOverride?: string;
+  geminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
   imageData?: string;            // Base64 image data (first image for display)
   mediaType?: string;            // MIME type
   imageStorageUrl?: string;      // Supabase storage URL
@@ -53,4 +55,5 @@ export interface RouterPayload {
   mediaType?: string;
   imageStorageUrl?: string;
   modelOverride?: RouterModel;
+  geminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
 }

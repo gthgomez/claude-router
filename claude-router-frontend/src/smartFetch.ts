@@ -3,7 +3,13 @@
 
 import { supabase } from './lib/supabase';
 import { CONFIG } from './config';
-import type { Message, RouterModel, RouterProvider, FileUploadPayload } from './types';
+import type {
+  FileUploadPayload,
+  GeminiFlashThinkingLevel,
+  Message,
+  RouterModel,
+  RouterProvider,
+} from './types';
 
 function base64UrlDecode(input: string): string {
   const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
@@ -156,7 +162,8 @@ export async function askClaude(
   query: string,
   history: Message[] = [],
   attachments: FileUploadPayload[] = [], // ✅ Changed from single to array
-  modelOverride?: RouterModel | null
+  modelOverride?: RouterModel | null,
+  geminiFlashThinkingLevel: GeminiFlashThinkingLevel = 'high',
 ): Promise<{
   stream: ReadableStream<Uint8Array>;
   model: RouterModel;
@@ -164,6 +171,7 @@ export async function askClaude(
   complexityScore: number;
   modelId?: string;
   modelOverride?: string;
+  geminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
 } | null> {
   try {
     const routerEndpoint = CONFIG.ROUTER_ENDPOINT || getEnvVar('VITE_ROUTER_ENDPOINT');
@@ -212,6 +220,8 @@ export async function askClaude(
       console.log('[smartFetch] Manual model override:', modelOverride);
     }
 
+    payload.geminiFlashThinkingLevel = geminiFlashThinkingLevel;
+
     console.log('[smartFetch] Request:', {
       endpoint: routerEndpoint,
       conversationId,
@@ -219,7 +229,8 @@ export async function askClaude(
       historyLength: history.length,
       imageCount: imageAttachments.length,
       textFileCount: textAttachments.length,
-      modelOverride: modelOverride || 'auto'
+      modelOverride: modelOverride || 'auto',
+      geminiFlashThinkingLevel,
     });
 
     const doFetch = (token: string) => fetch(routerEndpoint, {
@@ -288,20 +299,25 @@ export async function askClaude(
     const modelHeader = (
       response.headers.get('X-Router-Model') ||
       response.headers.get('X-Claude-Model') ||
-      'sonnet-4.5'
+      'gemini-3-flash'
     ) as RouterModel;
     const modelIdHeader = response.headers.get('X-Router-Model-Id') || response.headers.get('X-Claude-Model-Id') || '';
     const providerHeader = response.headers.get('X-Provider') as RouterProvider | null;
     const overrideHeader = response.headers.get('X-Model-Override') || '';
+    const geminiThinkingHeader = response.headers.get('X-Gemini-Thinking-Level') || '';
     const complexityHeader = response.headers.get('X-Complexity-Score');
     const rationaleHeader = response.headers.get('X-Router-Rationale');
     const complexityScore = complexityHeader ? parseInt(complexityHeader, 10) : 50;
+    const appliedGeminiThinkingLevel = geminiThinkingHeader === 'low' || geminiThinkingHeader === 'high'
+      ? geminiThinkingHeader
+      : undefined;
 
     console.log('[smartFetch] Response:', {
       model: modelHeader,
       provider: providerHeader || undefined,
       modelId: modelIdHeader,
       override: overrideHeader,
+      geminiThinking: appliedGeminiThinkingLevel,
       complexity: complexityScore,
       rationale: rationaleHeader,
       status: response.status
@@ -317,7 +333,8 @@ export async function askClaude(
       provider: providerHeader || undefined,
       complexityScore,
       modelId: modelIdHeader || undefined,
-      modelOverride: overrideHeader || undefined
+      modelOverride: overrideHeader || undefined,
+      geminiFlashThinkingLevel: appliedGeminiThinkingLevel,
     };
   } catch (error) {
     console.error('[smartFetch] Error:', error);
@@ -332,9 +349,24 @@ export async function askClaudeSync(
   query: string,
   history: Message[] = [],
   attachments: FileUploadPayload[] = [],
-  modelOverride?: RouterModel | null
-): Promise<{ content: string; model: RouterModel; provider?: RouterProvider; complexityScore: number; modelId?: string; modelOverride?: string } | null> {
-  const result = await askClaude(query, history, attachments, modelOverride);
+  modelOverride?: RouterModel | null,
+  geminiFlashThinkingLevel: GeminiFlashThinkingLevel = 'high',
+): Promise<{
+  content: string;
+  model: RouterModel;
+  provider?: RouterProvider;
+  complexityScore: number;
+  modelId?: string;
+  modelOverride?: string;
+  geminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
+} | null> {
+  const result = await askClaude(
+    query,
+    history,
+    attachments,
+    modelOverride,
+    geminiFlashThinkingLevel,
+  );
   if (!result) return null;
 
   const reader = result.stream.getReader();
@@ -354,7 +386,8 @@ export async function askClaudeSync(
       provider: result.provider,
       complexityScore: result.complexityScore,
       modelId: result.modelId,
-      modelOverride: result.modelOverride
+      modelOverride: result.modelOverride,
+      geminiFlashThinkingLevel: result.geminiFlashThinkingLevel,
     };
   } catch (error) {
     console.error('[smartFetch] Stream reading error:', error);
