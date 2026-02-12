@@ -13,10 +13,11 @@ import {
   type RouteDecision,
   type RouterModel,
   type RouterParams,
-  transformMessagesForClaude,
+  transformMessagesForAnthropic,
   transformMessagesForGoogle,
   transformMessagesForOpenAI,
 } from './router_logic.ts';
+import { calculatePreFlightCost } from './cost_engine.ts';
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -96,7 +97,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
   'Access-Control-Expose-Headers':
-    'X-Claude-Model, X-Claude-Model-Id, X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level, X-Memory-Hits, X-Memory-Tokens',
+    'X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level, X-Memory-Hits, X-Memory-Tokens, X-Cost-Estimate-USD, X-Cost-Pricing-Version',
 };
 
 const FUNCTION_TIMEOUT_MS = 55000;
@@ -446,7 +447,7 @@ async function callAnthropic(
     body: JSON.stringify({
       model: decision.model,
       max_tokens: decision.budgetCap,
-      messages: transformMessagesForClaude(allMessages, images),
+      messages: transformMessagesForAnthropic(allMessages, images),
       stream: true,
     }),
     signal,
@@ -1302,6 +1303,15 @@ Deno.serve(async (req: Request) => {
     }
     decision = availabilityCheck.decision;
 
+    const historyContext = history
+      .map((msg) => `${msg.role}: ${msg.content}`)
+      .join('\n');
+    const preFlightCost = calculatePreFlightCost(
+      decision.modelTier,
+      `${historyContext}\nuser: ${effectiveQuery}`,
+      imageAttachments.length,
+    );
+
     if (DEV_MODE) {
       console.log('[ROUTER] Decision:', {
         provider: decision.provider,
@@ -1418,8 +1428,6 @@ Deno.serve(async (req: Request) => {
         ...CORS_HEADERS,
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'X-Claude-Model': decision.modelTier,
-        'X-Claude-Model-Id': effectiveModelId,
         'X-Router-Model': decision.modelTier,
         'X-Router-Model-Id': effectiveModelId,
         'X-Provider': decision.provider,
@@ -1429,6 +1437,8 @@ Deno.serve(async (req: Request) => {
         'X-Gemini-Thinking-Level': upstream.effectiveGeminiFlashThinkingLevel || 'n/a',
         'X-Memory-Hits': String(memoryRetrieval.hits),
         'X-Memory-Tokens': String(memoryRetrieval.tokenCount),
+        'X-Cost-Estimate-USD': preFlightCost.estimatedUsd.toFixed(6),
+        'X-Cost-Pricing-Version': preFlightCost.pricingVersion,
       },
     });
   } catch (error) {
