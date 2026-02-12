@@ -17,7 +17,7 @@ import {
   transformMessagesForGoogle,
   transformMessagesForOpenAI,
 } from './router_logic.ts';
-import { calculatePreFlightCost } from './cost_engine.ts';
+import { calculateCostBreakdown, calculatePreFlightCost } from './cost_engine.ts';
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -38,6 +38,23 @@ interface MessageRecord {
   token_count: number;
   model_used?: string | undefined;
   image_url?: string | undefined;
+  created_at?: string;
+}
+
+interface CostLogRecord {
+  id?: string;
+  user_id: string;
+  conversation_id: string;
+  model: string;
+  provider: string;
+  input_tokens: number;
+  output_tokens: number;
+  thinking_tokens: number;
+  input_cost: number;
+  output_cost: number;
+  thinking_cost: number;
+  total_cost: number;
+  pricing_version?: string;
   created_at?: string;
 }
 
@@ -617,7 +634,7 @@ function createNormalizedProxyStream(params: {
   upstreamBody: ReadableStream<Uint8Array>;
   extractDeltas: (payload: unknown) => string[];
   onDelta: (delta: string) => void;
-  onComplete: () => void;
+  onComplete: () => Promise<void> | void;
 }): ReadableStream<Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -657,10 +674,10 @@ function createNormalizedProxyStream(params: {
     }
   };
 
-  const finalize = () => {
+  const finalize = async () => {
     if (completed) return;
     completed = true;
-    params.onComplete();
+    await params.onComplete();
   };
 
   return new ReadableStream<Uint8Array>({
@@ -697,7 +714,7 @@ function createNormalizedProxyStream(params: {
           } catch {
             // ignore
           }
-          finalize();
+          await finalize();
         }
       })();
     },
@@ -707,7 +724,7 @@ function createNormalizedProxyStream(params: {
       } catch {
         // ignore
       } finally {
-        finalize();
+        await finalize();
       }
     },
   });
@@ -1084,6 +1101,17 @@ function persistMessageAsync(
   })();
 }
 
+async function persistCostLog(
+  supabase: ReturnType<typeof createClient>,
+  record: CostLogRecord,
+): Promise<void> {
+  try {
+    await supabase.from('cost_logs').insert(record as never);
+  } catch (err) {
+    console.error('[DB] Cost log persist failed:', err);
+  }
+}
+
 // ============================================================================
 // MAIN HANDLER
 // ============================================================================
@@ -1402,8 +1430,32 @@ Deno.serve(async (req: Request) => {
       onDelta: (delta) => {
         assistantText += delta;
       },
-      onComplete: () => {
+      onComplete: async () => {
         const assistantTokenCount = countTokens(assistantText);
+        const costBreakdown = calculateCostBreakdown(decision.modelTier, {
+          promptTokens: userTokenCount,
+          completionTokens: assistantTokenCount,
+          reasoningTokens: 0,
+        });
+
+        await persistCostLog(
+          supabaseClient as unknown as ReturnType<typeof createClient>,
+          {
+            user_id: userId,
+            conversation_id: conversationId,
+            model: decision.modelTier,
+            provider: decision.provider,
+            input_tokens: costBreakdown.promptTokens,
+            output_tokens: costBreakdown.completionTokens,
+            thinking_tokens: costBreakdown.reasoningTokens,
+            input_cost: costBreakdown.inputCostUsd,
+            output_cost: costBreakdown.outputCostUsd,
+            thinking_cost: costBreakdown.reasoningCostUsd,
+            total_cost: costBreakdown.totalUsd,
+            pricing_version: costBreakdown.pricingVersion,
+          },
+        );
+
         if (assistantText.trim()) {
           persistMessageAsync(
             supabaseClient as unknown as ReturnType<typeof createClient>,

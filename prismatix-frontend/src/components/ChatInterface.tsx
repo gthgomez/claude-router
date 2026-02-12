@@ -7,11 +7,18 @@ import { ContextWarning } from './ContextWarning';
 import { ContextStatus } from './ContextStatus';
 import { FileUpload } from './FileUpload';
 import { BudgetGuard, evaluateBudget } from './BudgetGuard';
+import { CostEstimator } from './CostEstimator';
 import { CostBadge } from './CostBadge';
 import { PrismatixPulse } from './PrismatixPulse';
+import { SpendTracker } from './SpendTracker';
 import { ThinkingProcess } from './ThinkingProcess';
 import { askPrismatix, resetConversation } from '../smartFetch';
-import { calculateFinalCost, calculatePreFlightCost, estimateTokenCount } from '../costEngine';
+import {
+  calculateFinalCost,
+  calculatePreFlightCost,
+  estimateTokenCount,
+  type UsageEstimate,
+} from '../costEngine';
 import { uploadAttachment } from '../services/storageService';
 import { getDailyTotal, recordCost } from '../services/financeTracker';
 import type { FileUploadPayload, GeminiFlashThinkingLevel, Message, RouterModel } from '../types';
@@ -43,6 +50,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
     estimateUsd: number;
     dailyTotalUsd: number;
   } | null>(null);
+  const [currentUsage, setCurrentUsage] = useState<UsageEstimate | null>(null);
+  const [costModel, setCostModel] = useState<RouterModel>('gemini-3-flash');
+  const [sessionCostTotal, setSessionCostTotal] = useState(0);
+  const [spendRefreshKey, setSpendRefreshKey] = useState(0);
+  const [showCostEstimator, setShowCostEstimator] = useState(false);
+  const [finalMessageCost, setFinalMessageCost] = useState<number | null>(null);
 
   // ✅ FIX: Changed from single attachment to ARRAY of attachments
   const [draftAttachments, setDraftAttachments] = useState<FileUploadPayload[]>([]);
@@ -62,6 +75,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const userMenuRef = useRef<HTMLDivElement>(null);
   const modelSelectorRef = useRef<HTMLDivElement>(null);
+  const costEstimatorHideTimeoutRef = useRef<number | null>(null);
 
   const updateStickyScrollState = () => {
     const container = chatMessagesRef.current;
@@ -147,6 +161,27 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
     setShowModelSelector(false);
   };
 
+  const clearCostEstimatorHideTimer = () => {
+    if (costEstimatorHideTimeoutRef.current !== null) {
+      window.clearTimeout(costEstimatorHideTimeoutRef.current);
+      costEstimatorHideTimeoutRef.current = null;
+    }
+  };
+
+  const scheduleCostEstimatorHide = (delayMs = 3000) => {
+    clearCostEstimatorHideTimer();
+    costEstimatorHideTimeoutRef.current = window.setTimeout(() => {
+      setShowCostEstimator(false);
+      setCurrentUsage(null);
+      setFinalMessageCost(null);
+      costEstimatorHideTimeoutRef.current = null;
+    }, delayMs);
+  };
+
+  useEffect(() => {
+    return () => clearCostEstimatorHideTimer();
+  }, []);
+
   const handleSend = async (skipBudgetCheck = false) => {
     // Allow send if there's text OR attachments
     const hasContent = input.trim() || draftAttachments.length > 0;
@@ -169,18 +204,20 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
       }
     }
 
+    const estimatedModel = manualModelOverride || currentModel;
+    const historyText = messages.map((msg) => {
+      const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+      return `${msg.role}: ${content}`;
+    }).join('\n');
+    const imageCount = draftAttachments.filter((file) => file.isImage).length;
+    const preflight = calculatePreFlightCost(
+      estimatedModel,
+      `${historyText}\nuser: ${queryText}`,
+      imageCount,
+    );
+    const promptTokenEstimate = preflight.promptTokens;
+
     if (!skipBudgetCheck) {
-      const estimatedModel = manualModelOverride || currentModel;
-      const historyText = messages.map((msg) => {
-        const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-        return `${msg.role}: ${content}`;
-      }).join('\n');
-      const imageCount = draftAttachments.filter((file) => file.isImage).length;
-      const preflight = calculatePreFlightCost(
-        estimatedModel,
-        `${historyText}\nuser: ${queryText}`,
-        imageCount,
-      );
       const dailyTotalUsd = getDailyTotal();
       const budgetDecision = evaluateBudget({
         estimateUsd: preflight.estimatedUsd,
@@ -239,6 +276,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
     setIsStreaming(true);
     setIsWaitingFirstToken(true);
     waitingFirstTokenRef.current = true;
+    clearCostEstimatorHideTimer();
+    setShowCostEstimator(true);
+    setFinalMessageCost(null);
+    setCostModel(estimatedModel);
+    setCurrentUsage({
+      promptTokens: promptTokenEstimate,
+      completionTokens: 0,
+      thinkingTokens: 0,
+    });
 
     try {
       // Upload image attachments (graceful failure)
@@ -284,6 +330,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
       if (!manualModelOverride) {
         setCurrentModel(model);
       }
+      setCostModel(model);
       setCurrentComplexity(complexityScore);
 
       const reader = stream.getReader();
@@ -337,6 +384,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
                   const thoughtChunk = typeof json.chunk === 'string' ? json.chunk : '';
                   if (thoughtChunk) {
                     thinkingLog.push(thoughtChunk);
+                    setCurrentUsage({
+                      promptTokens: promptTokenEstimate,
+                      completionTokens: estimateTokenCount(assistantContent),
+                      thinkingTokens: estimateTokenCount(thinkingLog.join('')),
+                    });
                   }
                 } else if (json.type === 'meta') {
                   const finalUsd = Number(
@@ -360,6 +412,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
             }
           }
         }
+
+        setCurrentUsage({
+          promptTokens: promptTokenEstimate,
+          completionTokens: estimateTokenCount(assistantContent),
+          thinkingTokens: estimateTokenCount(thinkingLog.join('')),
+        });
 
         setMessages((prev) => {
           const updated = [...prev];
@@ -399,6 +457,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
       const completionTokens = estimateTokenCount(assistantContent);
       const computedCost = calculateFinalCost(model, { promptTokens, completionTokens });
       const finalUsd = streamedFinalUsd ?? computedCost.finalUsd;
+      setFinalMessageCost(finalUsd);
 
       if (finalUsd > 0) {
         recordCost({
@@ -406,7 +465,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           cost: finalUsd,
           pricingVersion: costPricingVersion || computedCost.pricingVersion,
         });
+        setSessionCostTotal((prev) => prev + finalUsd);
       }
+      setSpendRefreshKey((prev) => prev + 1);
 
       setMessages((prev) => {
         const updated = [...prev];
@@ -425,6 +486,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         }
         return updated;
       });
+      scheduleCostEstimatorHide(3000);
     } catch (error) {
       console.error('Stream error:', error);
       setMessages((prev) => [...prev, {
@@ -432,6 +494,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         content: `⚠️ Error: ${error instanceof Error ? error.message : 'Unknown error occurred'}`,
         timestamp: Date.now(),
       }]);
+      scheduleCostEstimatorHide(1500);
     } finally {
       setIsStreaming(false);
       setIsWaitingFirstToken(false);
@@ -465,6 +528,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
       setManualModelOverride(null);
       setGeminiFlashThinkingLevel('high');
       setBudgetConfirm(null);
+      setCurrentUsage(null);
+      setSessionCostTotal(0);
+      setCostModel('gemini-3-flash');
+      setShowCostEstimator(false);
+      setFinalMessageCost(null);
+      clearCostEstimatorHideTimer();
       setIsWaitingFirstToken(false);
       waitingFirstTokenRef.current = false;
     }
@@ -493,6 +562,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           </div>
           <div className='header-actions'>
             {contextStatus && <ContextStatus contextStatus={contextStatus} />}
+            <SpendTracker refreshKey={spendRefreshKey} />
 
             {/* Model Selector - CLICKABLE */}
             <div className='model-selector-container' ref={modelSelectorRef}>
@@ -520,7 +590,6 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
                   <span className='complexity-label'>{currentComplexity}</span>
                 </div>
                 {manualModelOverride && <span className='manual-badge'>Manual</span>}
-                {isWaitingFirstToken && <PrismatixPulse color={modelConfig.color} />}
               </button>
 
               {/* Model Dropdown */}
@@ -767,6 +836,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
                         <span className='cursor-blink'>▊</span>
                       )}
                     </div>
+                    {isWaitingFirstToken && isStreaming && idx === messages.length - 1 &&
+                      msg.role === 'assistant' && (
+                      <div className='message-thinking-loader'>
+                        <PrismatixPulse
+                          color={msg.model ? MODEL_CONFIG[msg.model].color : modelConfig.color}
+                          showLogo
+                        />
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
@@ -888,6 +966,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         dailyLimitUsd={DAILY_BUDGET_LIMIT_USD}
         onCancel={handleBudgetCancel}
         onConfirm={handleBudgetConfirmSend}
+      />
+
+      <CostEstimator
+        model={costModel}
+        usage={currentUsage}
+        isVisible={showCostEstimator}
+        isStreaming={isStreaming}
+        totalCost={sessionCostTotal}
+        finalCostUsd={finalMessageCost}
       />
 
       <style>
@@ -1026,21 +1113,39 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         }
 
         .prismatix-pulse-track {
-          position: absolute;
-          inset: -2px;
-          border-radius: 0.5rem;
+          position: relative;
+          height: 1.6rem;
+          border-radius: 0.6rem;
           overflow: hidden;
           pointer-events: none;
-          border: 1px solid rgba(255, 255, 255, 0.25);
+          border: 1px solid rgba(255, 255, 255, 0.2);
+          background: rgba(255, 255, 255, 0.04);
         }
 
         .prismatix-pulse-fill {
           --pulse-color: #4ECDC4;
-          width: 45%;
-          height: 100%;
+          position: absolute;
+          inset: 0;
           background: linear-gradient(90deg, transparent, var(--pulse-color), transparent);
-          opacity: 0.75;
+          opacity: 0.8;
           animation: prismPulse 1.25s ease-in-out infinite;
+        }
+
+        .prismatix-pulse-logo {
+          position: absolute;
+          top: 50%;
+          left: 0.45rem;
+          width: 0.8rem;
+          height: 0.8rem;
+          transform: translateY(-50%);
+          opacity: 0.75;
+          z-index: 1;
+          animation: logoPulse 0.9s ease-in-out infinite alternate;
+        }
+
+        .message-thinking-loader {
+          margin-top: 0.4rem;
+          max-width: 16rem;
         }
 
         .model-dropdown {
@@ -1379,15 +1484,226 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           background: rgba(255, 107, 107, 0.2);
         }
 
+        .cost-estimator {
+          position: fixed;
+          right: 1rem;
+          bottom: 5.5rem;
+          width: 230px;
+          z-index: 1200;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          border-radius: 0.75rem;
+          padding: 0.7rem;
+          background: rgba(10, 12, 16, 0.88);
+          backdrop-filter: blur(16px);
+          box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+          transition: opacity 0.25s ease, transform 0.25s ease;
+          opacity: 1;
+          transform: translateY(0);
+        }
+
+        .cost-estimator.streaming {
+          opacity: 1;
+        }
+
+        .cost-estimator.final {
+          opacity: 0.92;
+          transform: translateY(0);
+        }
+
+        .cost-estimator-title {
+          font-size: 0.76rem;
+          color: rgba(255, 255, 255, 0.82);
+          font-weight: 600;
+          margin-bottom: 0.45rem;
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }
+
+        .cost-estimator-rows {
+          display: flex;
+          flex-direction: column;
+          gap: 0.24rem;
+          font-size: 0.74rem;
+        }
+
+        .cost-estimator-row,
+        .cost-estimator-total,
+        .cost-estimator-session {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+        }
+
+        .cost-estimator-row {
+          color: rgba(255, 255, 255, 0.72);
+        }
+
+        .cost-estimator-total {
+          margin-top: 0.3rem;
+          padding-top: 0.3rem;
+          border-top: 1px solid rgba(255, 255, 255, 0.12);
+          color: rgba(255, 255, 255, 0.9);
+          font-weight: 700;
+        }
+
+        .cost-estimator-session {
+          margin-top: 0.5rem;
+          padding-top: 0.45rem;
+          border-top: 1px dashed rgba(255, 255, 255, 0.18);
+          font-size: 0.72rem;
+          color: rgba(255, 255, 255, 0.68);
+        }
+
+        .cost-estimator-session strong {
+          color: #fff;
+          font-size: 0.78rem;
+        }
+
+        .cost-estimator-final-note {
+          margin-top: 0.4rem;
+          font-size: 0.68rem;
+          color: rgba(255, 255, 255, 0.58);
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }
+
+        .spend-widget {
+          position: relative;
+        }
+
+        .spend-pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 0.5rem;
+          border-radius: 0.6rem;
+          border: 1px solid rgba(78, 205, 196, 0.4);
+          background: rgba(18, 26, 40, 0.58);
+          color: #fff;
+          cursor: pointer;
+          padding: 0.42rem 0.62rem;
+          font-family: inherit;
+          min-height: 40px;
+        }
+
+        .spend-pill-value {
+          font-size: 0.86rem;
+          font-weight: 700;
+          color: #7ef3db;
+        }
+
+        .spend-pill-label {
+          font-size: 0.72rem;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: rgba(255, 255, 255, 0.74);
+        }
+
+        .spend-pill-state {
+          font-size: 0.62rem;
+          padding: 0.15rem 0.34rem;
+          border-radius: 0.34rem;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }
+
+        .spend-pill-state.idle {
+          color: rgba(126, 243, 219, 0.95);
+          border-color: rgba(126, 243, 219, 0.35);
+          background: rgba(126, 243, 219, 0.12);
+        }
+
+        .spend-pill-state.syncing {
+          color: rgba(255, 220, 146, 0.95);
+          border-color: rgba(255, 220, 146, 0.35);
+          background: rgba(255, 220, 146, 0.12);
+        }
+
+        .spend-pill-state.error {
+          color: rgba(255, 156, 156, 0.95);
+          border-color: rgba(255, 156, 156, 0.35);
+          background: rgba(255, 156, 156, 0.12);
+        }
+
+        .spend-popover {
+          position: absolute;
+          top: calc(100% + 8px);
+          left: 0;
+          width: 270px;
+          z-index: 1200;
+          border: 1px solid rgba(255, 255, 255, 0.14);
+          border-radius: 0.75rem;
+          padding: 0.75rem;
+          background: linear-gradient(180deg, rgba(18, 26, 40, 0.82), rgba(10, 12, 16, 0.82));
+          backdrop-filter: blur(16px);
+          box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+        }
+
+        .spend-popover h3 {
+          margin: 0 0 0.55rem;
+          font-size: 0.8rem;
+          color: rgba(255, 255, 255, 0.9);
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+        }
+
+        .spend-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 0.45rem;
+        }
+
+        .spend-card {
+          border-radius: 0.55rem;
+          padding: 0.42rem 0.5rem;
+          background: rgba(255, 255, 255, 0.06);
+          border: 1px solid rgba(255, 255, 255, 0.08);
+        }
+
+        .spend-label {
+          font-size: 0.64rem;
+          color: rgba(255, 255, 255, 0.58);
+          text-transform: uppercase;
+          letter-spacing: 0.04em;
+        }
+
+        .spend-value {
+          margin-top: 0.15rem;
+          font-size: 0.9rem;
+          font-weight: 700;
+          color: #fff;
+        }
+
+        .spend-last {
+          margin-top: 0.6rem;
+          border-radius: 0.55rem;
+          background: rgba(255, 196, 70, 0.1);
+          border: 1px solid rgba(255, 196, 70, 0.24);
+          color: rgba(255, 226, 160, 0.9);
+          font-size: 0.72rem;
+          line-height: 1.5;
+          padding: 0.45rem 0.5rem;
+        }
+
+        .spend-sync-note {
+          margin-top: 0.45rem;
+          color: rgba(255, 255, 255, 0.62);
+          font-size: 0.67rem;
+        }
+
         @keyframes dropdownIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes slideIn { from { opacity: 0; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }
         @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes pulse { 0% { transform: scale(1); opacity: 1; } 100% { transform: scale(1.1); opacity: 0; } }
         @keyframes prismPulse {
-          0% { transform: translateX(-100%); opacity: 0.4; }
+          0% { transform: translateX(-100%); opacity: 0.35; }
           45% { opacity: 0.95; }
-          100% { transform: translateX(260%); opacity: 0.2; }
+          100% { transform: translateX(100%); opacity: 0.2; }
+        }
+        @keyframes logoPulse {
+          from { opacity: 0.45; }
+          to { opacity: 1; }
         }
 
         @media (max-width: 768px) {
@@ -1401,6 +1717,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           .model-dropdown { right: 0; left: 0; width: calc(100vw - 2rem); max-width: 360px; }
           .model-grid { grid-template-columns: 1fr; max-width: 200px; }
           .model-info { display: none; }
+          .spend-widget { flex: 1 1 auto; }
+          .spend-pill { width: 100%; justify-content: space-between; }
+          .spend-popover { width: min(320px, calc(100vw - 2rem)); left: 0; right: auto; }
+          .cost-estimator {
+            right: 0.75rem;
+            left: 0.75rem;
+            bottom: 5.25rem;
+            width: auto;
+          }
         }
       `}
       </style>
