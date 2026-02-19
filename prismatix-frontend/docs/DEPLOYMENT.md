@@ -1,6 +1,6 @@
-# Deployment Guide - Claude Router Frontend
+# Deployment Guide - Prismatix Frontend
 
-Complete guide for deploying your Claude Router frontend to production.
+Complete guide for deploying your Prismatix Frontend to production.
 
 ## Pre-Deployment Checklist
 
@@ -125,7 +125,7 @@ Netlify Dashboard → Site Settings → Build & Deploy → Environment
 ```bash
 npm i -g wrangler
 wrangler login
-wrangler pages project create claude-router
+wrangler pages project create prismatix
 wrangler pages deploy dist
 ```
 
@@ -235,16 +235,16 @@ server {
 **Deploy to any cloud:**
 ```bash
 # Build image
-docker build -t claude-router .
+docker build -t prismatix .
 
 # Run locally
-docker run -p 8080:80 claude-router
+docker run -p 8080:80 prismatix
 
 # Tag for registry
-docker tag claude-router your-registry/claude-router:latest
+docker tag prismatix your-registry/prismatix:latest
 
 # Push
-docker push your-registry/claude-router:latest
+docker push your-registry/prismatix:latest
 ```
 
 ---
@@ -515,10 +515,10 @@ vercel --prod
 
 ```bash
 # Tag previous version
-docker pull your-registry/claude-router:previous
+docker pull your-registry/prismatix:previous
 
 # Redeploy
-kubectl rollout undo deployment/claude-router
+kubectl rollout undo deployment/prismatix
 ```
 
 ---

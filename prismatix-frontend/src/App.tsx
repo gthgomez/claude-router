@@ -6,6 +6,7 @@ import { ChatInterface } from './components/ChatInterface';
 import { Auth } from './components/Auth';
 import { ResetPassword } from './components/ResetPassword';
 import { useAuth } from './hooks/useAuth';
+import { useViewportHeight } from './hooks/useViewportHeight';
 
 function isRecoveryFlow(): boolean {
   const { pathname, search, hash } = window.location;
@@ -21,6 +22,8 @@ function isRecoveryFlow(): boolean {
 }
 
 function App() {
+  useViewportHeight();
+
   const { 
     isAuthenticated, 
     isLoading, 
@@ -67,7 +70,8 @@ function App() {
 
         <style>{`
           .loading-screen {
-            height: 100vh;
+            height: calc(var(--app-vh, 1vh) * 100);
+            min-height: 100dvh;
             display: flex;
             align-items: center;
             justify-content: center;

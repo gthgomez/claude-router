@@ -16,6 +16,16 @@ function hostOf(value: string): string {
 }
 
 const SUPABASE_URL = ENV_SUPABASE_URL || DERIVED_SUPABASE_URL;
+const ENABLE_VIDEO_PIPELINE = (() => {
+  const raw = String(import.meta.env.VITE_ENABLE_VIDEO_PIPELINE || '').trim().toLowerCase();
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
+})();
+
+function functionEndpoint(name: string): string {
+  if (!SUPABASE_URL) return '';
+  return `${String(SUPABASE_URL).replace(/\/$/, '')}/functions/v1/${name}`;
+}
+
 const ROUTER_ENDPOINT = (() => {
   if (ENV_ROUTER_ENDPOINT && hostOf(ENV_ROUTER_ENDPOINT) === hostOf(SUPABASE_URL)) {
     return ENV_ROUTER_ENDPOINT;
@@ -33,6 +43,8 @@ export const CONFIG = {
   
   // Router Endpoint (modern format: https://[PROJECT_ID].supabase.co/functions/v1/[function-name])
   ROUTER_ENDPOINT,
+  VIDEO_INTAKE_ENDPOINT: functionEndpoint('video-intake'),
+  VIDEO_STATUS_ENDPOINT: functionEndpoint('video-status'),
   
   // Platform Detection
   PLATFORM: (() => {
@@ -43,7 +55,8 @@ export const CONFIG = {
   })() as 'web' | 'mobile' | 'desktop',
   
   // Model Configuration
-  MODELS: MODEL_CATALOG
+  MODELS: MODEL_CATALOG,
+  ENABLE_VIDEO_PIPELINE,
 } as const;
 
 // Validate required config

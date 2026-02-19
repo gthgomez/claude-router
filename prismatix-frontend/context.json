@@ -1,5 +1,5 @@
 {
-  "project": "Claude Router Frontend",
+  "project": "Prismatix Frontend",
   "environment": {
     "runtime": "Deno",
     "framework": "React (Vite/TS)",

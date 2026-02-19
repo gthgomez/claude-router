@@ -1,6 +1,6 @@
-# 🚀 Quick Start Guide - Claude Router Frontend
+# 🚀 Quick Start Guide - Prismatix Frontend
 
-Get your Claude Router frontend running in **3 minutes**.
+Get your Prismatix Frontend running in **3 minutes**.
 
 ## Prerequisites
 
@@ -12,8 +12,8 @@ Get your Claude Router frontend running in **3 minutes**.
 
 ```bash
 # Create new project directory
-mkdir claude-router-frontend
-cd claude-router-frontend
+mkdir prismatix-frontend
+cd prismatix-frontend
 
 # Copy all provided files into this directory
 # (ChatInterface.tsx, ModelIndicator.tsx, smartFetch.ts, etc.)
@@ -59,7 +59,7 @@ Your app will open at `http://localhost:3000` 🎉
 ## Project Structure
 
 ```
-claude-router-frontend/
+prismatix-frontend/
 ├── src/
 │   ├── ChatInterface.tsx      ← Main chat UI
 │   ├── ModelIndicator.tsx     ← Model display
@@ -92,7 +92,7 @@ claude-router-frontend/
 - Run `npm run type-check` to find TypeScript errors
 
 ### Models not showing correctly
-- Check browser console for `X-Claude-Model` header
+- Check browser console for `X-Router-Model` header
 - Verify router is returning model info in response
 
 ## Next Steps
@@ -135,3 +135,4 @@ Build output will be in `dist/` directory.
 ---
 
 **Ready to build?** Start with `npm run dev` and explore! 🚀
+

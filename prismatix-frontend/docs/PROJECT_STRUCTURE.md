@@ -1,11 +1,11 @@
 # Project Structure
 
-Complete file organization for Claude Router Frontend.
+Complete file organization for Prismatix Frontend.
 
 ## Directory Tree
 
 ```
-claude-router-frontend/
+prismatix-frontend/
 │
 ├── src/                          # Source files
 │   ├── ChatInterface.tsx         # Main chat interface component
@@ -283,3 +283,4 @@ ModelIndicator.tsx → Animation smoothness
 ---
 
 **Navigate this structure** using your editor's file tree or command line! 🗂️
+

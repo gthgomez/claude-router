@@ -1,7 +1,7 @@
 {
-  "name": "claude-router-frontend",
+  "name": "prismatix-frontend",
   "version": "2.0.0",
-  "description": "Intelligent Claude model router frontend with streaming support",
+  "description": "Intelligent multi-provider model router frontend with streaming support",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -30,7 +30,7 @@
   "author": "Jonathan",
   "license": "MIT",
   "keywords": [
-    "claude",
+    "prismatix",
     "anthropic",
     "ai",
     "chatbot",
@@ -39,3 +39,4 @@
     "react"
   ]
 }
+

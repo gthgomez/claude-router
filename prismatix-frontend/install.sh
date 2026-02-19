@@ -1,9 +1,9 @@
 #!/bin/bash
-# install.sh - Quick installation script for Claude Router Frontend
+# install.sh - Quick installation script for Prismatix Frontend
 
 set -e
 
-echo "🚀 Claude Router Frontend - Installation Script"
+echo "🚀 Prismatix Frontend - Installation Script"
 echo "================================================"
 echo ""
 

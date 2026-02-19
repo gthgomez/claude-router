@@ -3,6 +3,7 @@
 // Supports multiple simultaneous file uploads with progress tracking
 
 import React, { useRef, useState, useCallback } from 'react';
+import { CONFIG } from '../config';
 import type { FileUploadPayload } from '../types';
 
 interface FileUploadProps {
@@ -32,10 +33,74 @@ const ACCEPTED_TYPES = {
 
 const ACCEPT_STRING = [
   'image/*',
+  'video/*',
+  '.txt', '.md', '.json', '.csv',
+  '.py', '.ts', '.tsx', '.js', '.jsx',
+  '.html', '.css', '.sql', '.yaml', '.yml',
+  '.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'
+].join(',');
+
+const ACCEPTED_TEXT_EXTENSIONS = new Set([
   '.txt', '.md', '.json', '.csv',
   '.py', '.ts', '.tsx', '.js', '.jsx',
   '.html', '.css', '.sql', '.yaml', '.yml'
-].join(',');
+]);
+
+const ACCEPTED_IMAGE_EXTENSIONS = new Set([
+  '.jpg', '.jpeg', '.png', '.gif', '.webp'
+]);
+
+const VIDEO_EXTENSIONS = new Set([
+  '.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'
+]);
+
+const ACCEPTED_TEXT_MIME_TYPES = new Set([
+  ...ACCEPTED_TYPES.documents,
+  ...ACCEPTED_TYPES.code,
+  'text/html',
+  'text/css',
+  'application/sql',
+  'text/x-sql',
+  'application/yaml',
+  'application/x-yaml',
+  'text/yaml',
+]);
+
+const MAX_SINGLE_FILE_BYTES = 50 * 1024 * 1024;
+const MAX_TEXT_FILE_BYTES = 300 * 1024;
+const MAX_TEXT_FILE_CHARS = 45000;
+
+function getExtension(fileName: string): string {
+  const idx = fileName.lastIndexOf('.');
+  if (idx < 0) return '';
+  return fileName.slice(idx).toLowerCase();
+}
+
+function detectFileKind(file: File): 'image' | 'text' | 'video' | 'unsupported' {
+  const mimeType = String(file.type || '').toLowerCase();
+  const extension = getExtension(file.name);
+
+  const isImage = ACCEPTED_TYPES.images.includes(mimeType) || ACCEPTED_IMAGE_EXTENSIONS.has(extension);
+  if (isImage) return 'image';
+
+  const isVideo = mimeType.startsWith('video/') || VIDEO_EXTENSIONS.has(extension);
+  if (isVideo) return 'video';
+
+  const isText =
+    mimeType.startsWith('text/') ||
+    ACCEPTED_TEXT_MIME_TYPES.has(mimeType) ||
+    ACCEPTED_TEXT_EXTENSIONS.has(extension);
+  if (isText) return 'text';
+
+  return 'unsupported';
+}
+
+function createClientId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
 
 export const FileUpload: React.FC<FileUploadProps> = ({ 
   onFileContent, 
@@ -57,14 +122,46 @@ export const FileUpload: React.FC<FileUploadProps> = ({
    * Process a single file and return a FileUploadPayload
    */
   const processFile = useCallback(async (file: File): Promise<FileUploadPayload | null> => {
-    // L3 SAFETY GATE 1: Validate individual file size (10MB per file)
-    const MAX_SINGLE_FILE = 10 * 1024 * 1024;
-    if (file.size > MAX_SINGLE_FILE) {
-      console.warn(`[FileUpload] File "${file.name}" exceeds 10MB limit`);
+    // L3 SAFETY GATE 1: Validate individual file size (50MB per file)
+    if (file.size > MAX_SINGLE_FILE_BYTES) {
+      console.warn(`[FileUpload] File "${file.name}" exceeds 50MB limit`);
+      alert(`"${file.name}" exceeds the 50MB upload limit.`);
       return null;
     }
 
-    const isImage = file.type.startsWith('image/');
+    // L3 SAFETY GATE 1B: Enforce supported file categories.
+    const fileKind = detectFileKind(file);
+    if (fileKind === 'video') {
+      if (!CONFIG.ENABLE_VIDEO_PIPELINE) {
+        console.warn(`[FileUpload] Video upload blocked for "${file.name}"`);
+        alert('Video uploads are disabled for this environment.');
+        return null;
+      }
+      return {
+        clientId: createClientId(),
+        name: file.name,
+        kind: 'video',
+        isImage: false,
+        file,
+        mediaType: file.type || 'video/mp4',
+        size: file.size,
+        status: 'pending_upload',
+        uploadProgress: 0,
+      };
+    }
+
+    if (fileKind === 'unsupported') {
+      console.warn(`[FileUpload] Unsupported file type for "${file.name}" (${file.type || 'unknown'})`);
+      alert(`Unsupported file type for "${file.name}". Please upload images or text/code files.`);
+      return null;
+    }
+
+    const isImage = fileKind === 'image';
+    if (!isImage && file.size > MAX_TEXT_FILE_BYTES) {
+      console.warn(`[FileUpload] Text file "${file.name}" exceeds ${MAX_TEXT_FILE_BYTES} byte safety limit`);
+      alert(`"${file.name}" is too large for text analysis. Please keep text files under 300KB.`);
+      return null;
+    }
 
     return new Promise((resolve) => {
       const reader = new FileReader();
@@ -95,7 +192,9 @@ export const FileUpload: React.FC<FileUploadProps> = ({
           }
 
           resolve({
+            clientId: createClientId(),
             name: file.name,
+            kind: 'image',
             isImage: true,
             imageData: base64String,
             mediaType: file.type,
@@ -109,8 +208,17 @@ export const FileUpload: React.FC<FileUploadProps> = ({
             return;
           }
 
+          if (result.length > MAX_TEXT_FILE_CHARS) {
+            console.warn(`[FileUpload] Text content too large for "${file.name}" (${result.length} chars)`);
+            alert(`"${file.name}" is too large to process safely. Please reduce it to under 45,000 characters.`);
+            resolve(null);
+            return;
+          }
+
           resolve({
+            clientId: createClientId(),
             name: file.name,
+            kind: 'text',
             isImage: false,
             content: result,
             size: file.size
@@ -251,7 +359,7 @@ export const FileUpload: React.FC<FileUploadProps> = ({
         className={`file-upload-button ${isProcessing ? 'processing' : ''}`}
         title={isProcessing 
           ? `Processing ${processing?.completed}/${processing?.total} files...`
-          : `Attach files (max ${maxFiles}, images or text)`
+          : `Attach files (max ${maxFiles}, images, text${CONFIG.ENABLE_VIDEO_PIPELINE ? ', video' : ''})`
         }
         aria-label="Attach files"
       >

@@ -10,6 +10,7 @@ A modern, isometric app icon for "Prismatix," set against a deep charcoal backgr
 
 ## Current Draft Asset
 
-- `claude-router-frontend/public/prismatix-icon-draft.svg`
+- `prismatix-frontend/public/prismatix-icon-draft.svg`
 
 This SVG is a hand-drafted placeholder aligned to the concept and wired as the frontend favicon.
+

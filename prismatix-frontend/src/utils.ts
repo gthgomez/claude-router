@@ -1,4 +1,4 @@
-// utils.ts - Utility functions for Claude Router Frontend
+// utils.ts - Utility functions for Prismatix Frontend
 
 import type { Message, RouterModel } from './types';
 import { MODEL_CATALOG } from './modelCatalog';

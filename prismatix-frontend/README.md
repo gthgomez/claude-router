@@ -84,7 +84,6 @@ interface RouterRequest {
 X-Router-Model: model key selected by router
 X-Router-Model-Id: provider model identifier
 X-Provider: anthropic | openai | google
-X-Claude-Model: legacy compatibility alias
 X-Complexity-Score: 0-100
 ```
 
@@ -107,10 +106,10 @@ function App() {
 ### Programmatic API Call
 
 ```typescript
-import { askClaude } from './smartFetch';
+import { askPrismatix } from './smartFetch';
 
 async function example() {
-  const result = await askClaude("Explain quantum computing", []);
+  const result = await askPrismatix("Explain quantum computing", []);
   
   if (result) {
     const { stream, model, complexityScore } = result;
@@ -234,7 +233,7 @@ The router validates that the authenticated user owns the conversation ID via RL
 - Check for ad blockers interfering with streams
 
 ### No model indicator showing
-- Verify router returns `X-Router-Model` (or legacy `X-Claude-Model`) header
+- Verify router returns `X-Router-Model` header
 - Check browser console for errors
 
 ## Performance

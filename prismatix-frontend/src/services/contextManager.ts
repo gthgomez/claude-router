@@ -12,7 +12,7 @@ export interface ContextAnalysis {
 }
 
 export class ContextManager {
-  private readonly MAX_CONTEXT_TOKENS = 200000; // approx for Claude 3.5 Sonnet
+  private readonly MAX_CONTEXT_TOKENS = 200000; // approx for frontier model context windows
   private readonly WARNING_THRESHOLD = 0.8; // 80%
 
   constructor() {}

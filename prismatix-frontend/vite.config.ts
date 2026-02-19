@@ -1,4 +1,4 @@
-// vite.config.ts - Vite configuration for Claude Router Frontend
+// vite.config.ts - Vite configuration for Prismatix Frontend
 
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
