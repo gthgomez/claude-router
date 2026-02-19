@@ -61,7 +61,7 @@ export function useRouterStream() {
     }
 
     // 3. CAPTURE METADATA HEADERS (The "Why")
-    const model = res.headers.get('X-Router-Model') || res.headers.get('X-Claude-Model');
+    const model = res.headers.get('X-Router-Model');
     const rationale = res.headers.get('X-Router-Rationale');
     const score = Number(res.headers.get('X-Complexity-Score') || 0);
 

@@ -1,3 +1,3 @@
--- Seed data for Claude_Router
+-- Seed data for Prismatix
 -- Intentionally minimal: schema/migrations live in supabase/migrations/.
 

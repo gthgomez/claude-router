@@ -38,7 +38,9 @@ export const MODEL_REGISTRY = {
   },
   'sonnet-4.5': {
     provider: 'anthropic',
-    modelId: 'claude-sonnet-4-5-20250929',
+    // NOTE: Keep RouterModel key stable for frontend compatibility.
+    // Update only the underlying modelId to the latest Sonnet.
+    modelId: 'claude-sonnet-4-6-20260218',
     budgetCap: 8000,
     supportsImages: true,
   },
@@ -188,7 +190,7 @@ export function countImageTokens(images?: ImageAttachment[]): number {
   return images.length * 1600;
 }
 
-interface ClaudeImageBlock {
+interface AnthropicImageBlock {
   type: 'image';
   source: {
     type: 'base64';
@@ -197,22 +199,22 @@ interface ClaudeImageBlock {
   };
 }
 
-interface ClaudeTextBlock {
+interface AnthropicTextBlock {
   type: 'text';
   text: string;
 }
 
-type ClaudeContent = string | Array<ClaudeImageBlock | ClaudeTextBlock>;
+type AnthropicContent = string | Array<AnthropicImageBlock | AnthropicTextBlock>;
 
-export function transformMessagesForClaude(
+export function transformMessagesForAnthropic(
   messages: Message[],
   currentImages?: ImageAttachment[],
-): Array<{ role: 'user' | 'assistant'; content: ClaudeContent }> {
+): Array<{ role: 'user' | 'assistant'; content: AnthropicContent }> {
   return messages.map((msg, index) => {
     const isLastMessage = index === messages.length - 1;
 
     if (isLastMessage && msg.role === 'user' && currentImages && currentImages.length > 0) {
-      const contentArray: Array<ClaudeImageBlock | ClaudeTextBlock> = [];
+      const contentArray: Array<AnthropicImageBlock | AnthropicTextBlock> = [];
 
       for (const img of currentImages) {
         contentArray.push({
@@ -444,7 +446,7 @@ function buildDecision(
   };
 }
 
-export function isClaudeModel(modelTier: RouterModel): boolean {
+export function isAnthropicModel(modelTier: RouterModel): boolean {
   return MODEL_REGISTRY[modelTier].provider === 'anthropic';
 }
 

@@ -1,4 +1,4 @@
--- Initial schema for Claude_Router conversations/messages + token counter RPC
+-- Initial schema for Prismatix conversations/messages + token counter RPC
 
 create extension if not exists pgcrypto with schema extensions;
 

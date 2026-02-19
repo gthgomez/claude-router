@@ -1,8 +1,8 @@
 {
-  "buildCommand": "cd claude-router-frontend && npm install && npm run build",
-  "outputDirectory": "claude-router-frontend/dist",
-  "devCommand": "cd claude-router-frontend && npm run dev",
-  "installCommand": "cd claude-router-frontend && npm install",
+  "buildCommand": "cd prismatix-frontend && npm install && npm run build",
+  "outputDirectory": "prismatix-frontend/dist",
+  "devCommand": "cd prismatix-frontend && npm run dev",
+  "installCommand": "cd prismatix-frontend && npm install",
   "framework": null,
   "rewrites": [
     {

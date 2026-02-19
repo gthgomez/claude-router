@@ -392,3 +392,15 @@ s3_secret_key = "env(S3_SECRET_KEY)"
 
 [functions.router]
 verify_jwt = false
+
+[functions.spend_stats]
+verify_jwt = false
+
+[functions.video-intake]
+verify_jwt = false
+
+[functions.video-status]
+verify_jwt = false
+
+[functions.video-worker]
+verify_jwt = false

@@ -18,6 +18,17 @@ import {
   transformMessagesForOpenAI,
 } from './router_logic.ts';
 import { calculateCostBreakdown, calculatePreFlightCost } from './cost_engine.ts';
+import {
+  DEFAULT_DEBATE_THRESHOLD,
+  getDebatePlan,
+  type DebateProfile,
+  type DebateTrigger,
+} from './debate_profiles.ts';
+import {
+  buildChallengerPrompt,
+  buildSynthesisPrompt,
+  type ChallengerOutput,
+} from './debate_prompts.ts';
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -105,6 +116,12 @@ interface MemoryRetrievalResult {
 
 type GeminiFlashThinkingLevel = 'low' | 'high';
 
+interface VideoAssetReadyRecord {
+  id: string;
+  user_id: string;
+  status: 'pending_upload' | 'uploaded' | 'processing' | 'ready' | 'failed' | 'expired';
+}
+
 // ============================================================================
 // CONSTANTS & CONFIGURATION
 // ============================================================================
@@ -114,11 +131,16 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
   'Access-Control-Expose-Headers':
-    'X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level, X-Memory-Hits, X-Memory-Tokens, X-Cost-Estimate-USD, X-Cost-Pricing-Version',
+    'X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level, X-Memory-Hits, X-Memory-Tokens, X-Cost-Estimate-USD, X-Cost-Pricing-Version, X-Debate-Mode, X-Debate-Profile, X-Debate-Trigger, X-Debate-Cost-Note',
 };
 
 const FUNCTION_TIMEOUT_MS = 55000;
 const MAX_QUERY_LENGTH = 50000;
+const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+const MAX_VIDEO_ASSETS_PER_REQUEST = 4;
+const VIDEO_IMAGE_TOKEN_ESTIMATE = 1600;
+const VIDEO_TRANSCRIPT_TOKEN_ESTIMATE = 3000;
+const VIDEO_MAX_FRAME_TOKENS = 8 * VIDEO_IMAGE_TOKEN_ESTIMATE;
 const DEV_MODE = Deno.env.get('DEV_MODE') === 'true';
 
 const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') || '';
@@ -141,6 +163,16 @@ function envFlag(name: string, defaultValue: boolean): boolean {
 const ENABLE_ANTHROPIC = envFlag('ENABLE_ANTHROPIC', true);
 const ENABLE_OPENAI = envFlag('ENABLE_OPENAI', true);
 const ENABLE_GOOGLE = envFlag('ENABLE_GOOGLE', true);
+const ENABLE_VIDEO_PIPELINE = envFlag('ENABLE_VIDEO_PIPELINE', false);
+
+// Debate Mode flags (router "tool" toggle)
+const ENABLE_DEBATE_MODE = envFlag('ENABLE_DEBATE_MODE', false);
+const ENABLE_DEBATE_AUTO = envFlag('ENABLE_DEBATE_AUTO', false);
+const DEBATE_COMPLEXITY_THRESHOLD = Number(Deno.env.get('DEBATE_COMPLEXITY_THRESHOLD') || '') ||
+  DEFAULT_DEBATE_THRESHOLD;
+// Per-challenger token budget caps — prevents cost runaway regardless of text truncation.
+const DEBATE_WORKER_MAX_TOKENS_GENERAL = Number(Deno.env.get('DEBATE_WORKER_MAX_TOKENS_GENERAL') || '') || 400;
+const DEBATE_WORKER_MAX_TOKENS_CODE = Number(Deno.env.get('DEBATE_WORKER_MAX_TOKENS_CODE') || '') || 700;
 
 const GOOGLE_MODELS_CACHE_TTL_MS = 10 * 60 * 1000;
 let googleModelsCache: { fetchedAt: number; models: GoogleModelRecord[] } | null = null;
@@ -284,6 +316,219 @@ function normalizeDecisionAgainstProviderAvailability(
   return {
     decision: fallbackDecision,
   };
+}
+
+// ============================================================================
+// DEBATE MODE HELPERS
+// ============================================================================
+
+function normalizeDebateProfile(input?: string): DebateProfile {
+  const v = String(input || '').trim().toLowerCase();
+  if (v === 'code' || v === 'coding') return 'code';
+  return 'general';
+}
+
+function parseDebateRequest(inputMode?: string, rawModelOverride?: string, profile?: string): {
+  requested: boolean;
+  profile: DebateProfile;
+  trigger: DebateTrigger;
+  // If modelOverride is being used as a "debate toggle", suppress it from normalizeModelOverride()
+  suppressModelOverride: boolean;
+  overrideHeaderValue: string; // used for X-Model-Override when debate is explicit
+} {
+  const p = normalizeDebateProfile(profile);
+  const mode = String(inputMode || '').trim().toLowerCase();
+  const raw = String(rawModelOverride || '').trim().toLowerCase();
+
+  // Explicit via body.mode = "debate"
+  if (mode === 'debate') {
+    return {
+      requested: true,
+      profile: p,
+      trigger: 'explicit',
+      suppressModelOverride: false,
+      overrideHeaderValue: `debate:${p}`,
+    };
+  }
+
+  // Compatibility: allow modelOverride = "debate" or "debate:code"
+  if (raw === 'debate' || raw.startsWith('debate:')) {
+    const maybeProfile = raw.split(':')[1] || '';
+    const pp = normalizeDebateProfile(maybeProfile);
+    return {
+      requested: true,
+      profile: pp,
+      trigger: 'explicit',
+      suppressModelOverride: true,
+      overrideHeaderValue: `debate:${pp}`,
+    };
+  }
+
+  return {
+    requested: false,
+    profile: p,
+    trigger: 'off',
+    suppressModelOverride: false,
+    overrideHeaderValue: '',
+  };
+}
+
+async function consumeUpstreamToText(
+  upstream: UpstreamCallResult,
+  signal: AbortSignal,
+  maxChars: number,
+): Promise<string> {
+  if (!upstream.response.ok) return '';
+  const body = upstream.response.body;
+  if (!body) return '';
+
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let acc = '';
+
+  try {
+    while (true) {
+      if (signal.aborted) break;
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const dataStr = trimmed.slice(5).trim();
+        if (!dataStr || dataStr === '[DONE]') continue;
+        const payload = tryParseJson(dataStr);
+        if (!payload) continue;
+        const deltas = upstream.extractDeltas(payload);
+        for (const d of deltas) {
+          if (!d) continue;
+          acc += d;
+          if (acc.length >= maxChars) return acc.slice(0, maxChars - 1) + '…';
+        }
+      }
+    }
+  } catch {
+    // ignore; treat as partial
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore
+    }
+  }
+
+  return acc.trim();
+}
+
+function isProviderReadyForModelTier(modelTier: RouterModel): boolean {
+  const provider = MODEL_REGISTRY[modelTier].provider;
+  return isProviderReady(provider);
+}
+
+interface DebateRunResult {
+  upstream: UpstreamCallResult;
+  synthesisMessages: Message[];
+}
+
+async function maybeRunDebateMode(params: {
+  decision: RouteDecision;
+  allMessages: Message[];
+  images: ImageAttachment[];
+  hasVideo: boolean;
+  signal: AbortSignal;
+  geminiFlashThinkingLevel: GeminiFlashThinkingLevel;
+  debateProfile: DebateProfile;
+  workerMaxTokens: number;
+}): Promise<DebateRunResult | null> {
+  // MVP: debate disabled for images or video (avoid multi-model vision/tool complexity).
+  if (params.images.length > 0 || params.hasVideo) return null;
+
+  const primaryTier = params.decision.modelTier;
+  const plan = getDebatePlan(params.debateProfile, primaryTier);
+
+  // Readiness gating: every model tier we will call must have provider ready.
+  if (!isProviderReadyForModelTier(primaryTier)) return null;
+  for (const c of plan.challengers) {
+    if (!isProviderReadyForModelTier(c.modelTier)) return null;
+  }
+
+  // Run challengers in parallel (streaming, consumed to text, bounded timeout).
+  const challengerRuns = plan.challengers.map(async (c): Promise<ChallengerOutput | null> => {
+    const workerController = new AbortController();
+    const timeoutMs = params.debateProfile === 'code' ? 12000 : 10000;
+    const tid = setTimeout(() => workerController.abort(), timeoutMs);
+    try {
+      const workerPrompt = buildChallengerPrompt(
+        params.debateProfile,
+        c.role,
+        params.allMessages.at(-1)?.content || '',
+      );
+      const workerMessages: Message[] = [
+        // Keep context small: last 6 turns + challenger prompt as final user msg.
+        ...params.allMessages.slice(Math.max(0, params.allMessages.length - 6)),
+        { role: 'user', content: workerPrompt },
+      ];
+
+      // Cap challenger budget to prevent cost runaway; text truncation alone is insufficient.
+      const workerDecision: RouteDecision = {
+        ...decisionFromModel(c.modelTier, params.decision.complexityScore, `debate-worker-${c.role}`),
+        budgetCap: params.workerMaxTokens,
+      };
+
+      const upstream = await callProviderStream(
+        workerDecision,
+        workerMessages,
+        [],
+        workerController.signal,
+        params.geminiFlashThinkingLevel,
+      );
+
+      const text = await consumeUpstreamToText(
+        upstream,
+        workerController.signal,
+        plan.maxChallengerChars,
+      );
+      if (!text) return null;
+      return { role: c.role, modelTier: c.modelTier, text };
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(tid);
+    }
+  });
+
+  const challengerResults = (await Promise.all(challengerRuns)).filter(Boolean) as ChallengerOutput[];
+
+  // If no challengers succeed, fall back to the normal single-provider path.
+  if (challengerResults.length === 0) return null;
+
+  // Synthesis: ask the PRIMARY decision model to produce a final answer using debate notes.
+  const userQuery = params.allMessages.at(-1)?.content || '';
+  const synthesisPrompt = buildSynthesisPrompt(
+    params.debateProfile,
+    userQuery,
+    challengerResults,
+    plan.maxChallengerChars,
+  );
+
+  const synthesisMessages: Message[] = [
+    ...params.allMessages,
+    { role: 'user', content: synthesisPrompt },
+  ];
+
+  const upstream = await callProviderStream(
+    params.decision,
+    synthesisMessages,
+    [],
+    params.signal,
+    params.geminiFlashThinkingLevel,
+  );
+
+  return { upstream, synthesisMessages };
 }
 
 // ============================================================================
@@ -1101,6 +1346,61 @@ function persistMessageAsync(
   })();
 }
 
+function estimateVideoPromptTokens(videoAssetCount: number): number {
+  if (videoAssetCount <= 0) return 0;
+  const estimatedFrameCount = Math.min(videoAssetCount * 4, 8);
+  const estimatedFrameTokens = Math.min(
+    estimatedFrameCount * VIDEO_IMAGE_TOKEN_ESTIMATE,
+    VIDEO_MAX_FRAME_TOKENS,
+  );
+  return estimatedFrameTokens + VIDEO_TRANSCRIPT_TOKEN_ESTIMATE;
+}
+
+async function validateReadyVideoAssets(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  videoAssetIds: string[],
+): Promise<{ ok: true; ids: string[] } | { ok: false; error: string }> {
+  if (videoAssetIds.length === 0) {
+    return { ok: true, ids: [] };
+  }
+
+  const uniqueIds = [...new Set(videoAssetIds.filter((id) => typeof id === 'string' && id.trim()))];
+  if (uniqueIds.length === 0) {
+    return { ok: true, ids: [] };
+  }
+
+  if (!ENABLE_VIDEO_PIPELINE) {
+    return { ok: false, error: 'video_pipeline_disabled' };
+  }
+
+  if (uniqueIds.length > MAX_VIDEO_ASSETS_PER_REQUEST) {
+    return { ok: false, error: 'video_too_many_assets' };
+  }
+
+  const { data, error } = await supabase
+    .from('video_assets')
+    .select('id, user_id, status')
+    .in('id', uniqueIds);
+
+  if (error) {
+    console.error('[Video] validate assets query failed:', error);
+    return { ok: false, error: 'video_validation_failed' };
+  }
+
+  const rows = (data || []) as VideoAssetReadyRecord[];
+  if (rows.length !== uniqueIds.length) {
+    return { ok: false, error: 'video_not_ready' };
+  }
+
+  const allReady = rows.every((row) => row.user_id === userId && row.status === 'ready');
+  if (!allReady) {
+    return { ok: false, error: 'video_not_ready' };
+  }
+
+  return { ok: true, ids: uniqueIds };
+}
+
 async function persistCostLog(
   supabase: ReturnType<typeof createClient>,
   record: CostLogRecord,
@@ -1195,12 +1495,32 @@ Deno.serve(async (req: Request) => {
       platform?: 'web' | 'mobile';
       history?: Message[];
       images?: ImageAttachment[];
+      videoAssetIds?: string[];
       imageData?: string;
       mediaType?: string;
       imageStorageUrl?: string;
       modelOverride?: string;
       geminiFlashThinkingLevel?: string;
+      // Debate Mode tool toggle
+      mode?: string; // "debate" to enable
+      debateProfile?: string; // "general" | "code"
     };
+
+    const contentLengthHeader = req.headers.get('content-length');
+    if (contentLengthHeader) {
+      const contentLength = Number(contentLengthHeader);
+      if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BYTES) {
+        return new Response(
+          JSON.stringify({
+            error: `Payload too large. Max allowed size is ${Math.round(MAX_REQUEST_BYTES / (1024 * 1024))}MB.`,
+          }),
+          {
+            status: 413,
+            headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+          },
+        );
+      }
+    }
 
     try {
       body = await req.json();
@@ -1217,11 +1537,14 @@ Deno.serve(async (req: Request) => {
       platform = 'web',
       history = [],
       images,
+      videoAssetIds = [],
       imageData,
       mediaType,
       imageStorageUrl,
       modelOverride,
       geminiFlashThinkingLevel,
+      mode,
+      debateProfile,
     } = body;
 
     const normalizedGeminiFlashThinkingLevel = normalizeGeminiFlashThinkingLevel(
@@ -1238,9 +1561,10 @@ Deno.serve(async (req: Request) => {
 
     let query = rawQuery?.trim() || '';
     const hasImages = imageAttachments.length > 0;
+    const hasVideoAssets = Array.isArray(videoAssetIds) && videoAssetIds.length > 0;
 
-    if (!query && !hasImages) {
-      return new Response(JSON.stringify({ error: 'Bad Request: Missing query or image' }), {
+    if (!query && !hasImages && !hasVideoAssets) {
+      return new Response(JSON.stringify({ error: 'Bad Request: Missing query, image, or videoAssetIds' }), {
         status: 400,
         headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
@@ -1253,10 +1577,18 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    if (!query && hasImages) {
-      query = imageAttachments.length === 1
-        ? 'Please analyze this image.'
-        : `Please analyze these ${imageAttachments.length} images.`;
+    if (!query && (hasImages || hasVideoAssets)) {
+      if (hasImages && hasVideoAssets) {
+        query = 'Please analyze these images and videos.';
+      } else if (hasVideoAssets) {
+        query = videoAssetIds.length === 1
+          ? 'Please analyze this video.'
+          : `Please analyze these ${videoAssetIds.length} videos.`;
+      } else {
+        query = imageAttachments.length === 1
+          ? 'Please analyze this image.'
+          : `Please analyze these ${imageAttachments.length} images.`;
+      }
     }
 
     if (query.length > MAX_QUERY_LENGTH) {
@@ -1271,6 +1603,7 @@ Deno.serve(async (req: Request) => {
         userId: userId.slice(0, 8),
         conversationId: conversationId.slice(0, 8),
         imageCount: imageAttachments.length,
+        videoCount: videoAssetIds.length,
         queryLen: query.length,
         modelOverride: modelOverride || 'auto',
         geminiFlashThinkingLevel: normalizedGeminiFlashThinkingLevel,
@@ -1285,6 +1618,18 @@ Deno.serve(async (req: Request) => {
     if (!ownership.valid) {
       return new Response(JSON.stringify({ error: 'Forbidden: Invalid conversation ownership' }), {
         status: 403,
+        headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+      });
+    }
+
+    const videoValidation = await validateReadyVideoAssets(
+      supabaseClient as unknown as ReturnType<typeof createClient>,
+      userId,
+      Array.isArray(videoAssetIds) ? videoAssetIds : [],
+    );
+    if (!videoValidation.ok) {
+      return new Response(JSON.stringify({ error: videoValidation.error }), {
+        status: videoValidation.error === 'video_not_ready' ? 409 : 400,
         headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
@@ -1316,7 +1661,10 @@ Deno.serve(async (req: Request) => {
       images: imageAttachments,
     };
 
-    const normalizedOverride = normalizeModelOverride(modelOverride);
+    const debateReq = parseDebateRequest(mode, modelOverride, debateProfile);
+    const normalizedOverride = normalizeModelOverride(
+      debateReq.suppressModelOverride ? undefined : modelOverride,
+    );
     let decision = determineRoute(routerParams, normalizedOverride);
 
     const availabilityCheck = normalizeDecisionAgainstProviderAvailability(
@@ -1334,10 +1682,12 @@ Deno.serve(async (req: Request) => {
     const historyContext = history
       .map((msg) => `${msg.role}: ${msg.content}`)
       .join('\n');
+    const estimatedVideoPromptTokens = estimateVideoPromptTokens(videoValidation.ids.length);
     const preFlightCost = calculatePreFlightCost(
       decision.modelTier,
       `${historyContext}\nuser: ${effectiveQuery}`,
       imageAttachments.length,
+      estimatedVideoPromptTokens,
     );
 
     if (DEV_MODE) {
@@ -1357,15 +1707,72 @@ Deno.serve(async (req: Request) => {
 
     const allMessages = [...history, userMsg];
 
+    // Debate state — declared before try so both the catch and response-building can see them.
+    let debateActive = false;
+    let debateProfileEffective: DebateProfile = 'general';
+    let debateTriggerEffective: DebateTrigger = 'off';
+    let debateOverrideHeader = '';
+    let debateSynthesisMessages: Message[] | null = null;
+
     let upstream: UpstreamCallResult;
     try {
-      upstream = await callProviderStream(
-        decision,
-        allMessages,
-        imageAttachments,
-        controller.signal,
-        normalizedGeminiFlashThinkingLevel,
-      );
+      // Gate debate on any media: images or validated video assets.
+      const hasAnyMedia = hasImages || hasVideoAssets;
+      const shouldAutoDebate = ENABLE_DEBATE_MODE &&
+        ENABLE_DEBATE_AUTO &&
+        !debateReq.requested &&
+        !hasAnyMedia &&
+        decision.complexityScore >= DEBATE_COMPLEXITY_THRESHOLD;
+
+      const doDebate = ENABLE_DEBATE_MODE && (debateReq.requested || shouldAutoDebate) && !hasAnyMedia;
+      const debateTrigger: DebateTrigger = debateReq.requested
+        ? 'explicit'
+        : shouldAutoDebate
+        ? 'auto'
+        : 'off';
+
+      // Worker token cap: challenger budget by profile (not synthesis model).
+      const workerMaxTokens = debateReq.profile === 'code'
+        ? DEBATE_WORKER_MAX_TOKENS_CODE
+        : DEBATE_WORKER_MAX_TOKENS_GENERAL;
+
+      if (doDebate) {
+        const debateResult = await maybeRunDebateMode({
+          decision,
+          allMessages,
+          images: imageAttachments,
+          hasVideo: hasVideoAssets,
+          signal: controller.signal,
+          geminiFlashThinkingLevel: normalizedGeminiFlashThinkingLevel,
+          debateProfile: debateReq.profile,
+          workerMaxTokens,
+        });
+        // On failure (no challengers succeeded), fall through silently to the normal path.
+        if (debateResult) {
+          upstream = debateResult.upstream;
+          debateSynthesisMessages = debateResult.synthesisMessages;
+          debateActive = true;
+          debateProfileEffective = debateReq.profile;
+          debateTriggerEffective = debateTrigger;
+          debateOverrideHeader = debateReq.requested ? debateReq.overrideHeaderValue : '';
+        } else {
+          upstream = await callProviderStream(
+            decision,
+            allMessages,
+            imageAttachments,
+            controller.signal,
+            normalizedGeminiFlashThinkingLevel,
+          );
+        }
+      } else {
+        upstream = await callProviderStream(
+          decision,
+          allMessages,
+          imageAttachments,
+          controller.signal,
+          normalizedGeminiFlashThinkingLevel,
+        );
+      }
     } catch (upstreamError) {
       const message = upstreamError instanceof Error
         ? upstreamError.message
@@ -1404,7 +1811,9 @@ Deno.serve(async (req: Request) => {
 
     const effectiveModelId = upstream.effectiveModelId || decision.model;
 
-    const userTokenCount = countTokens(query) + countImageTokens(imageAttachments);
+    const userTokenCount = countTokens(query) +
+      countImageTokens(imageAttachments) +
+      estimatedVideoPromptTokens;
     persistMessageAsync(
       supabaseClient as unknown as ReturnType<typeof createClient>,
       conversationId,
@@ -1421,6 +1830,18 @@ Deno.serve(async (req: Request) => {
         headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
       });
     }
+
+    // When debate ran, synthesis messages are longer than the original prompt.
+    // Recompute the cost estimate so X-Cost-Estimate-USD reflects the actual synthesis call.
+    // Challenger costs remain excluded (noted by X-Debate-Cost-Note: partial).
+    const effectiveCostEstimateUsd = debateSynthesisMessages
+      ? calculatePreFlightCost(
+          decision.modelTier,
+          debateSynthesisMessages.map((m) => `${m.role}: ${m.content}`).join('\n'),
+          0, // synthesis call has no image attachments
+          0,
+        ).estimatedUsd
+      : preFlightCost.estimatedUsd;
 
     let assistantText = '';
 
@@ -1483,14 +1904,24 @@ Deno.serve(async (req: Request) => {
         'X-Router-Model': decision.modelTier,
         'X-Router-Model-Id': effectiveModelId,
         'X-Provider': decision.provider,
-        'X-Model-Override': normalizedOverride || 'auto',
+        // Preserve semantics: "override used or auto".
+        // If debate was explicitly requested, reflect that in X-Model-Override.
+        'X-Model-Override': debateOverrideHeader || normalizedOverride || 'auto',
         'X-Router-Rationale': decision.rationaleTag,
         'X-Complexity-Score': decision.complexityScore.toString(),
         'X-Gemini-Thinking-Level': upstream.effectiveGeminiFlashThinkingLevel || 'n/a',
         'X-Memory-Hits': String(memoryRetrieval.hits),
         'X-Memory-Tokens': String(memoryRetrieval.tokenCount),
-        'X-Cost-Estimate-USD': preFlightCost.estimatedUsd.toFixed(6),
+        'X-Cost-Estimate-USD': effectiveCostEstimateUsd.toFixed(6),
         'X-Cost-Pricing-Version': preFlightCost.pricingVersion,
+        // Debate headers are emitted ONLY when debate ran (absent = debate did not run).
+        ...(debateActive ? {
+          'X-Debate-Mode': 'true',
+          'X-Debate-Profile': debateProfileEffective,
+          'X-Debate-Trigger': debateTriggerEffective,
+          // Challenger costs are not included in the estimate; flag it.
+          'X-Debate-Cost-Note': 'partial',
+        } : {}),
       },
     });
   } catch (error) {
