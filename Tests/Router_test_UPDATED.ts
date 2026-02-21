@@ -23,12 +23,12 @@ Deno.test('Router: code-heavy complex queries prefer Sonnet for quality', () => 
       'web',
     ),
   );
-  assertEquals(decision.modelTier, 'sonnet-4.5');
+  assertEquals(decision.modelTier, 'sonnet-4.6');
   assertEquals(decision.rationaleTag, 'code-quality-priority');
 });
 
 Deno.test('Router: routes to Opus for very large context', () => {
   const decision = determineRoute(params('Summarize.', 155000, 'web'));
-  assertEquals(decision.modelTier, 'opus-4.5');
+  assertEquals(decision.modelTier, 'opus-4.6');
   assertEquals(decision.rationaleTag, 'high-complexity');
 });

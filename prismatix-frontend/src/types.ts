@@ -1,9 +1,10 @@
 // src/types.ts
 
-export type AnthropicModel = 'opus-4.5' | 'sonnet-4.5' | 'haiku-4.5';
-export type RouterModel = AnthropicModel | 'gpt-5-mini' | 'gemini-3-flash' | 'gemini-3-pro';
+export type AnthropicModel = 'opus-4.6' | 'sonnet-4.6' | 'haiku-4.5';
+export type RouterModel = AnthropicModel | 'gpt-5-mini' | 'gemini-3-flash' | 'gemini-3.1-pro';
 export type RouterProvider = 'anthropic' | 'openai' | 'google';
 export type GeminiFlashThinkingLevel = 'low' | 'high';
+export type DebateProfile = 'general' | 'code' | 'video_ui';
 export type AttachmentKind = 'image' | 'text' | 'video';
 export type VideoAssetStatus =
   | 'pending_upload'
@@ -28,6 +29,11 @@ export interface Message {
   modelId?: string;
   modelOverride?: string;
   geminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
+  debateActive?: boolean;
+  debateProfile?: DebateProfile;
+  debateTrigger?: string;
+  debateModel?: string;
+  debateCostNote?: string;
   imageData?: string;            // Base64 image data (first image for display)
   mediaType?: string;            // MIME type
   imageStorageUrl?: string;      // Supabase storage URL
@@ -83,4 +89,6 @@ export interface RouterPayload {
   imageStorageUrl?: string;
   modelOverride?: RouterModel;
   geminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
+  mode?: 'debate';
+  debateProfile?: DebateProfile;
 }

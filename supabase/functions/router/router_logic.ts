@@ -20,6 +20,7 @@ export interface RouterParams {
   platform: 'web' | 'mobile';
   history: Message[];
   images?: ImageAttachment[];
+  hasVideoAssets?: boolean;
 }
 
 interface ModelConfig {
@@ -36,17 +37,15 @@ export const MODEL_REGISTRY = {
     budgetCap: 4000,
     supportsImages: true,
   },
-  'sonnet-4.5': {
+  'sonnet-4.6': {
     provider: 'anthropic',
-    // NOTE: Keep RouterModel key stable for frontend compatibility.
-    // Update only the underlying modelId to the latest Sonnet.
-    modelId: 'claude-sonnet-4-6-20260218',
+    modelId: 'claude-sonnet-4-6',
     budgetCap: 8000,
     supportsImages: true,
   },
-  'opus-4.5': {
+  'opus-4.6': {
     provider: 'anthropic',
-    modelId: 'claude-opus-4-5-20251101',
+    modelId: 'claude-opus-4-6',
     budgetCap: 16000,
     supportsImages: true,
   },
@@ -58,13 +57,13 @@ export const MODEL_REGISTRY = {
   },
   'gemini-3-flash': {
     provider: 'google',
-    modelId: 'gemini-3-flash',
+    modelId: 'gemini-3-flash-preview',
     budgetCap: 8192,
     supportsImages: true,
   },
-  'gemini-3-pro': {
+  'gemini-3.1-pro': {
     provider: 'google',
-    modelId: 'gemini-3-pro',
+    modelId: 'gemini-3.1-pro-preview',
     budgetCap: 16384,
     supportsImages: true,
   },
@@ -83,16 +82,27 @@ export interface RouteDecision {
 }
 
 const OVERRIDE_SYNONYMS: Record<string, RouterModel> = {
+  // Anthropic — current keys
   'anthropic:haiku': 'haiku-4.5',
   'anthropic:haiku-4.5': 'haiku-4.5',
-  'anthropic:sonnet': 'sonnet-4.5',
-  'anthropic:sonnet-4.5': 'sonnet-4.5',
-  'anthropic:opus': 'opus-4.5',
-  'anthropic:opus-4.5': 'opus-4.5',
+  'anthropic:sonnet': 'sonnet-4.6',
+  'anthropic:sonnet-4.6': 'sonnet-4.6',
+  'anthropic:opus': 'opus-4.6',
+  'anthropic:opus-4.6': 'opus-4.6',
+  // Anthropic — backwards-compat (old keys)
+  'anthropic:sonnet-4.5': 'sonnet-4.6',
+  'sonnet-4.5': 'sonnet-4.6',
+  'anthropic:opus-4.5': 'opus-4.6',
+  'opus-4.5': 'opus-4.6',
+  // OpenAI
   'openai:gpt-5-mini': 'gpt-5-mini',
   'openai:gpt-mini': 'gpt-5-mini',
-  'google:gemini-3-pro': 'gemini-3-pro',
+  // Google — current keys
+  'google:gemini-3.1-pro': 'gemini-3.1-pro',
   'google:gemini-3-flash': 'gemini-3-flash',
+  // Google — backwards-compat (old key)
+  'google:gemini-3-pro': 'gemini-3.1-pro',
+  'gemini-3-pro': 'gemini-3.1-pro',
 };
 
 export function normalizeModelOverride(input?: string): RouterModel | undefined {
@@ -109,8 +119,8 @@ export function normalizeModelOverride(input?: string): RouterModel | undefined 
   }
 
   if (value.includes('haiku')) return 'haiku-4.5';
-  if (value.includes('sonnet')) return 'sonnet-4.5';
-  if (value.includes('opus')) return 'opus-4.5';
+  if (value.includes('sonnet')) return 'sonnet-4.6';
+  if (value.includes('opus')) return 'opus-4.6';
 
   if (value.includes('gpt-5-mini') || value.includes('gpt mini')) return 'gpt-5-mini';
 
@@ -123,11 +133,12 @@ export function normalizeModelOverride(input?: string): RouterModel | undefined 
   }
 
   if (
+    value.includes('gemini-3.1-pro') ||
     value.includes('gemini-3-pro') ||
     value.includes('gemini 3 pro') ||
     value.includes('gemini pro')
   ) {
-    return 'gemini-3-pro';
+    return 'gemini-3.1-pro';
   }
 
   return undefined;
@@ -462,6 +473,7 @@ function isCodeHeavyQuery(query: string): boolean {
 
 export function determineRoute(params: RouterParams, modelOverride?: RouterModel): RouteDecision {
   const hasImages = params.images && params.images.length > 0;
+  const hasVideoAssets = params.hasVideoAssets === true;
   const complexityScore = analyzeComplexity(params);
   const queryTokens = countTokens(params.userQuery) + countImageTokens(params.images);
   const totalTokens = params.currentSessionTokens + queryTokens;
@@ -471,9 +483,13 @@ export function determineRoute(params: RouterParams, modelOverride?: RouterModel
     return buildDecision(modelOverride, 'manual-override', complexityScore);
   }
 
+  if (hasVideoAssets) {
+    return buildDecision('gemini-3.1-pro', 'video-default-pro', complexityScore);
+  }
+
   if (hasImages) {
     if (complexityScore >= 70 || totalTokens > 60000) {
-      return buildDecision('gemini-3-pro', 'images-complex', complexityScore);
+      return buildDecision('gemini-3.1-pro', 'images-complex', complexityScore);
     }
     if (complexityScore <= 30 && totalTokens < 30000) {
       return buildDecision('gemini-3-flash', 'images-fast', complexityScore);
@@ -482,11 +498,11 @@ export function determineRoute(params: RouterParams, modelOverride?: RouterModel
   }
 
   if (codeHeavy && complexityScore >= 45 && totalTokens < 90000) {
-    return buildDecision('sonnet-4.5', 'code-quality-priority', complexityScore);
+    return buildDecision('sonnet-4.6', 'code-quality-priority', complexityScore);
   }
 
   if (complexityScore >= 80 || totalTokens > 100000) {
-    return buildDecision('opus-4.5', 'high-complexity', complexityScore);
+    return buildDecision('opus-4.6', 'high-complexity', complexityScore);
   }
 
   if (complexityScore <= 18 && queryTokens < 80 && totalTokens < 12000) {

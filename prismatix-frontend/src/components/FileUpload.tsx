@@ -53,6 +53,15 @@ const ACCEPTED_IMAGE_EXTENSIONS = new Set([
 const VIDEO_EXTENSIONS = new Set([
   '.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v'
 ]);
+const VIDEO_MIME_TYPES = new Set([
+  'video/mp4',
+  'video/quicktime',
+  'video/x-msvideo',
+  'video/x-matroska',
+  'video/webm',
+  'video/x-m4v',
+  'application/mp4',
+]);
 
 const ACCEPTED_TEXT_MIME_TYPES = new Set([
   ...ACCEPTED_TYPES.documents,
@@ -83,7 +92,10 @@ function detectFileKind(file: File): 'image' | 'text' | 'video' | 'unsupported' 
   const isImage = ACCEPTED_TYPES.images.includes(mimeType) || ACCEPTED_IMAGE_EXTENSIONS.has(extension);
   if (isImage) return 'image';
 
-  const isVideo = mimeType.startsWith('video/') || VIDEO_EXTENSIONS.has(extension);
+  const isVideo =
+    mimeType.startsWith('video/') ||
+    VIDEO_MIME_TYPES.has(mimeType) ||
+    VIDEO_EXTENSIONS.has(extension);
   if (isVideo) return 'video';
 
   const isText =
@@ -198,7 +210,8 @@ export const FileUpload: React.FC<FileUploadProps> = ({
             isImage: true,
             imageData: base64String,
             mediaType: file.type,
-            size: file.size
+            size: file.size,
+            file,
           });
         } else {
           // L3 SAFETY GATE 4: Validate text content
@@ -221,7 +234,9 @@ export const FileUpload: React.FC<FileUploadProps> = ({
             kind: 'text',
             isImage: false,
             content: result,
-            size: file.size
+            size: file.size,
+            file,
+            mediaType: file.type || 'text/plain',
           });
         }
       };

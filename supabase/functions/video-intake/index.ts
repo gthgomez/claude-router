@@ -152,6 +152,7 @@ Deno.serve(async (req: Request) => {
 
   if (operation === 'init') {
     const { fileName, mimeType, fileSizeBytes, conversationId } = body as InitRequestBody;
+    let conversationIdForAsset: string | null = conversationId || null;
 
     if (!fileName || !mimeType || !Number.isFinite(fileSizeBytes)) {
       return new Response(JSON.stringify({ error: 'Bad Request: Missing required fields' }), {
@@ -183,11 +184,34 @@ Deno.serve(async (req: Request) => {
         .eq('id', conversationId)
         .maybeSingle();
 
-      if (conversationError || !conversation || conversation.user_id !== user.id) {
+      if (conversationError) {
+        console.error('[video-intake] conversation lookup failed:', {
+          conversationId,
+          userId: user.id,
+          error: conversationError,
+        });
+        return new Response(JSON.stringify({ error: 'Failed to validate conversation ownership' }), {
+          status: 500,
+          headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+        });
+      }
+
+      if (conversation && conversation.user_id !== user.id) {
         return new Response(JSON.stringify({ error: 'Forbidden: Invalid conversation ownership' }), {
           status: 403,
           headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
         });
+      }
+
+      if (!conversation) {
+        console.log('[video-intake] New conversation detected, allowing upload for authenticated user', {
+          conversationId,
+          userId: user.id,
+        });
+        // Avoid FK failure when conversation row is not created yet.
+        conversationIdForAsset = null;
+      } else {
+        conversationIdForAsset = conversation.id;
       }
     }
 
@@ -213,7 +237,7 @@ Deno.serve(async (req: Request) => {
       .insert({
         id: assetId,
         user_id: user.id,
-        conversation_id: conversationId || null,
+        conversation_id: conversationIdForAsset,
         storage_bucket: VIDEO_UPLOAD_BUCKET,
         storage_path: storagePath,
         mime_type: normalizedMimeType,

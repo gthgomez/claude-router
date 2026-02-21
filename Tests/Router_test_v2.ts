@@ -12,6 +12,7 @@ function params(
   currentSessionTokens = 0,
   platform: 'web' | 'mobile' = 'web',
   images?: ImageAttachment[],
+  hasVideoAssets?: boolean,
 ): RouterParams {
   return {
     userQuery,
@@ -19,12 +20,13 @@ function params(
     platform,
     history: [],
     ...(images ? { images } : {}),
+    ...(hasVideoAssets ? { hasVideoAssets: true } : {}),
   };
 }
 
 Deno.test('determineRoute: manual override wins', () => {
-  const decision = determineRoute(params('Hello'), 'opus-4.5');
-  assertEquals(decision.modelTier, 'opus-4.5');
+  const decision = determineRoute(params('Hello'), 'opus-4.6');
+  assertEquals(decision.modelTier, 'opus-4.6');
   assertEquals(decision.rationaleTag, 'manual-override');
   assertEquals(decision.budgetCap, 16000);
   assertEquals(decision.provider, 'anthropic');
@@ -41,14 +43,21 @@ Deno.test('determineRoute: images default to Gemini Flash when fast path applies
 Deno.test('determineRoute: images route to Gemini Pro when context is large', () => {
   const images: ImageAttachment[] = [{ data: 'base64', mediaType: 'image/png' }];
   const decision = determineRoute(params('Please analyze this image.', 60000, 'web', images));
-  assertEquals(decision.modelTier, 'gemini-3-pro');
+  assertEquals(decision.modelTier, 'gemini-3.1-pro');
   assertEquals(decision.rationaleTag, 'images-complex');
+  assertEquals(decision.provider, 'google');
+});
+
+Deno.test('determineRoute: video requests default to Gemini Pro', () => {
+  const decision = determineRoute(params('Please analyze this video.', 0, 'web', undefined, true));
+  assertEquals(decision.modelTier, 'gemini-3.1-pro');
+  assertEquals(decision.rationaleTag, 'video-default-pro');
   assertEquals(decision.provider, 'google');
 });
 
 Deno.test('determineRoute: high total tokens trigger Opus', () => {
   const decision = determineRoute(params('Continue.', 120000, 'web'));
-  assertEquals(decision.modelTier, 'opus-4.5');
+  assertEquals(decision.modelTier, 'opus-4.6');
   assertEquals(decision.rationaleTag, 'high-complexity');
 });
 
@@ -70,7 +79,7 @@ Deno.test('determineRoute: code-heavy complex query routes to Sonnet', () => {
       'Please debug this TypeScript code and explain why it crashes: ```ts function test(){return;} ```',
     ),
   );
-  assertEquals(decision.modelTier, 'sonnet-4.5');
+  assertEquals(decision.modelTier, 'sonnet-4.6');
   assertEquals(decision.rationaleTag, 'code-quality-priority');
 });
 

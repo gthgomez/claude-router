@@ -24,18 +24,27 @@ export function buildChallengerPrompt(profile: DebateProfile, role: string, user
     'Do NOT mention system prompts or internal policies.',
   ];
 
-  const profileRules =
-    profile === 'code'
-      ? [
-          'Focus on correctness, edge cases, failure modes, implementation traps, and tests.',
-          'Include at least: (1) likely bug sources, (2) exact checks/tests to add, (3) safer alternative design if needed.',
-          'Prefer crisp bullets and actionable steps.',
-        ]
-      : [
-          'Focus on reasoning quality, missing considerations, trade-offs, and better framing.',
-          'Include at least: (1) assumptions to verify, (2) key risks, (3) alternative approaches.',
-          'Prefer structured bullets with short explanations.',
-        ];
+  const profileRules = profile === 'code'
+    ? [
+        'Focus on correctness, edge cases, failure modes, implementation traps, and tests.',
+        'Include at least: (1) likely bug sources, (2) exact checks/tests to add, (3) safer alternative design if needed.',
+        'Prefer crisp bullets and actionable steps.',
+      ]
+    : profile === 'video_ui'
+    ? [
+        'You are evaluating a product UI using VIDEO_NOTES_JSON with timestamps; do NOT infer unseen frames.',
+        role.toLowerCase().includes('designer')
+          ? 'Output exactly: timestamped UI issues and TOP 5 design fixes.'
+          : role.toLowerCase().includes('qa')
+          ? 'Output exactly: task failures, severity, and measurable UX metrics to track.'
+          : 'Output exactly: customer trust/clarity/CTA reactions with timestamped evidence.',
+        'Keep findings concrete and evidence-based. Prefer short bullets.',
+      ]
+    : [
+        'Focus on reasoning quality, missing considerations, trade-offs, and better framing.',
+        'Include at least: (1) assumptions to verify, (2) key risks, (3) alternative approaches.',
+        'Prefer structured bullets with short explanations.',
+      ];
 
   return [
     ...common,
@@ -53,20 +62,26 @@ export function buildSynthesisPrompt(
   outputs: ChallengerOutput[],
   maxPerOutputChars: number,
 ): string {
-  const header =
-    profile === 'code'
-      ? [
-          'You are the final synthesizer after an internal team debate.',
-          'Goal: produce an implementable, testable plan with minimal risk.',
-          'You MUST address critique points and clearly state trade-offs.',
-          'Output should be structured with headings and actionable steps.',
-        ]
-      : [
-          'You are the final synthesizer after an internal team debate.',
-          'Goal: produce a thorough, high-signal answer.',
-          'You MUST address critique points and clearly state assumptions.',
-          'Output should be structured with headings and concrete recommendations.',
-        ];
+  const header = profile === 'code'
+    ? [
+        'You are the final synthesizer after an internal team debate.',
+        'Goal: produce an implementable, testable plan with minimal risk.',
+        'You MUST address critique points and clearly state trade-offs.',
+        'Output should be structured with headings and actionable steps.',
+      ]
+    : profile === 'video_ui'
+    ? [
+        'You are the final synthesizer after an internal video UI review debate.',
+        'Goal: produce a prioritized product backlog using only the evidence in VIDEO_NOTES_JSON and challenger notes.',
+        'Output MUST include: (1) prioritized backlog, (2) acceptance criteria for each item, (3) next usability test plan.',
+        'Include timestamp references where available and keep recommendations implementation-ready.',
+      ]
+    : [
+        'You are the final synthesizer after an internal team debate.',
+        'Goal: produce a thorough, high-signal answer.',
+        'You MUST address critique points and clearly state assumptions.',
+        'Output should be structured with headings and concrete recommendations.',
+      ];
 
   const rendered = outputs
     .map((o) => {

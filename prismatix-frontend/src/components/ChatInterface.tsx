@@ -34,6 +34,13 @@ import type {
 } from '../types';
 import { MODEL_CATALOG, MODEL_ORDER } from '../modelCatalog';
 import type { User } from '@supabase/supabase-js';
+import {
+  DEBATE_SELECTIONS,
+  getDebatePayload,
+  hasReadyVideoAttachment,
+  type DebateSelection,
+  shouldShowDebateBadges,
+} from '../debateMode';
 
 interface ChatInterfaceProps {
   user: User | null;
@@ -42,6 +49,29 @@ interface ChatInterfaceProps {
 
 const MODEL_CONFIG = MODEL_CATALOG;
 const DAILY_BUDGET_LIMIT_USD = 2.0;
+const VIDEO_NAME_PATTERN = /\.(mp4|mov|avi|mkv|webm|m4v)$/i;
+
+function shouldTreatAsVideoAttachment(file: FileUploadPayload): boolean {
+  if (file.kind === 'video') return true;
+  if (typeof file.mediaType === 'string' && file.mediaType.toLowerCase().startsWith('video/')) {
+    return true;
+  }
+  return VIDEO_NAME_PATTERN.test(file.name || '');
+}
+
+function normalizeAttachmentKind(file: FileUploadPayload): FileUploadPayload {
+  if (!shouldTreatAsVideoAttachment(file)) {
+    return file;
+  }
+  return {
+    ...file,
+    kind: 'video',
+    isImage: false,
+    mediaType: file.mediaType || file.file?.type || 'video/mp4',
+    status: file.status || 'pending_upload',
+    uploadProgress: file.uploadProgress ?? 0,
+  };
+}
 
 export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut }) => {
   const [input, setInput] = useState('');
@@ -66,12 +96,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
   const [spendRefreshKey, setSpendRefreshKey] = useState(0);
   const [showCostEstimator, setShowCostEstimator] = useState(false);
   const [finalMessageCost, setFinalMessageCost] = useState<number | null>(null);
+  const [debateSelection, setDebateSelection] = useState<DebateSelection>('off');
+  const [sendValidationError, setSendValidationError] = useState<string | null>(null);
 
   // ✅ FIX: Changed from single attachment to ARRAY of attachments
   const [draftAttachments, setDraftAttachments] = useState<FileUploadPayload[]>([]);
   const hasPendingVideoUploads = draftAttachments.some(
     (file) => file.kind === 'video' && file.status !== 'ready',
   );
+  const hasReadyVideo = hasReadyVideoAttachment(draftAttachments);
 
   // Context Manager
   const {
@@ -130,6 +163,9 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
   // Auto-resize textarea
   const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setInput(e.target.value);
+    if (sendValidationError) {
+      setSendValidationError(null);
+    }
     e.target.style.height = 'auto';
     e.target.style.height = `${Math.min(e.target.scrollHeight, 200)}px`;
   };
@@ -180,7 +216,7 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           videoAssetId: uploaded.assetId,
           status: statusUpdate.status,
           durationMs: statusUpdate.durationMs || current.durationMs,
-          uploadProgress: statusUpdate.progress,
+          uploadProgress: Math.max(current.uploadProgress || 0, statusUpdate.progress || 0),
           errorCode: statusUpdate.error?.code || undefined,
         }));
       });
@@ -203,10 +239,15 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
   };
 
   const handleFileSelect = (file: FileUploadPayload) => {
-    console.log('[ChatInterface] File added:', file.name, file.isImage ? 'image' : 'text');
-    setDraftAttachments((prev) => [...prev, file]);
-    if (file.kind === 'video') {
-      void startVideoUpload(file);
+    const normalizedFile = normalizeAttachmentKind(file);
+    const kindLabel = normalizedFile.kind || (normalizedFile.isImage ? 'image' : 'text');
+    console.log('[ChatInterface] File added:', normalizedFile.name, kindLabel);
+    if (sendValidationError) {
+      setSendValidationError(null);
+    }
+    setDraftAttachments((prev) => [...prev, normalizedFile]);
+    if (normalizedFile.kind === 'video') {
+      void startVideoUpload(normalizedFile);
     }
     inputRef.current?.focus();
   };
@@ -214,8 +255,12 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
   // ✅ FIX: Handle multiple files at once - ADD all to array
   const handleMultipleFiles = (files: FileUploadPayload[]) => {
     console.log('[ChatInterface] Multiple files added:', files.length);
-    setDraftAttachments((prev) => [...prev, ...files]);
-    files.forEach((file) => {
+    if (sendValidationError) {
+      setSendValidationError(null);
+    }
+    const normalizedFiles = files.map(normalizeAttachmentKind);
+    setDraftAttachments((prev) => [...prev, ...normalizedFiles]);
+    normalizedFiles.forEach((file) => {
       if (file.kind === 'video') {
         void startVideoUpload(file);
       }
@@ -271,11 +316,16 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
     // Allow send if there's text OR attachments
     const hasContent = input.trim() || draftAttachments.length > 0;
     if (!hasContent || isStreaming || hasPendingVideoUploads) return;
+    if (debateSelection === 'video_ui' && !hasReadyVideo) {
+      setSendValidationError('Video UI debate requires at least one ready video attachment.');
+      return;
+    }
+    setSendValidationError(null);
     resetAutoScroll();
 
     // Build query text
     const hasImages = draftAttachments.some((f) => f.isImage);
-    const hasTextFiles = draftAttachments.some((f) => !f.isImage);
+    const hasTextFiles = draftAttachments.some((f) => !f.isImage && f.kind !== 'video');
 
     let queryText = input.trim();
 
@@ -401,9 +451,10 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
       const result = await askPrismatix(
         queryText,
         messages,
-      attachmentsToProcess,
+        attachmentsToProcess,
         manualModelOverride,
         geminiFlashThinkingLevel,
+        getDebatePayload(debateSelection),
       );
 
       if (!result) throw new Error('Failed to get response from router');
@@ -418,6 +469,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         geminiFlashThinkingLevel: appliedGeminiThinkingLevel,
         costEstimateUsd,
         costPricingVersion,
+        debateActive,
+        debateProfile,
+        debateTrigger,
+        debateModel,
+        debateCostNote,
       } = result;
 
       // âœ… FIX: Only update model if no manual override is active
@@ -443,6 +499,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         modelId,
         modelOverride: appliedOverride,
         geminiFlashThinkingLevel: appliedGeminiThinkingLevel,
+        debateActive,
+        debateProfile,
+        debateTrigger,
+        debateModel,
+        debateCostNote,
         thinkingLog: [],
         cost: costEstimateUsd !== undefined
           ? {
@@ -756,6 +817,26 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
               </div>
             </div>
 
+            <div className='debate-toggle-container' title='Debate routing mode'>
+              <span className='debate-toggle-label'>Debate</span>
+              <select
+                className='debate-select'
+                value={debateSelection}
+                onChange={(e) => {
+                  setDebateSelection(e.target.value as DebateSelection);
+                  if (sendValidationError) {
+                    setSendValidationError(null);
+                  }
+                }}
+              >
+                {DEBATE_SELECTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <button
               type='button'
               onClick={handleReset}
@@ -900,6 +981,22 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
                         <span className='message-model-override'>
                           thinking:{msg.geminiFlashThinkingLevel}
                         </span>
+                      )}
+                      {msg.role === 'assistant' && shouldShowDebateBadges(msg) && (
+                        <div className='debate-badge-group'>
+                          {msg.debateProfile && (
+                            <span className='debate-badge'>debate:{msg.debateProfile}</span>
+                          )}
+                          {msg.debateTrigger && (
+                            <span className='debate-badge'>trigger:{msg.debateTrigger}</span>
+                          )}
+                          {msg.debateModel && (
+                            <span className='debate-badge'>model:{msg.debateModel}</span>
+                          )}
+                          {msg.debateCostNote && (
+                            <span className='debate-badge'>{msg.debateCostNote}</span>
+                          )}
+                        </div>
                       )}
                       <CostBadge cost={msg.cost} />
                       <span className='message-time'>
@@ -1065,6 +1162,11 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
               )}
             </button>
           </div>
+          {sendValidationError && (
+            <div className='send-validation-error'>
+              {sendValidationError}
+            </div>
+          )}
         </div>
       </div>
 
@@ -1187,6 +1289,33 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           border-color: rgba(78, 205, 196, 0.6);
           background: rgba(78, 205, 196, 0.2);
           color: #4ECDC4;
+        }
+
+        .debate-toggle-container {
+          display: flex;
+          align-items: center;
+          gap: 0.45rem;
+          padding: 0.35rem 0.55rem;
+          border-radius: 0.5rem;
+          background: rgba(255, 255, 255, 0.04);
+          border: 1px solid rgba(255, 255, 255, 0.12);
+        }
+
+        .debate-toggle-label {
+          font-size: 0.68rem;
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: rgba(255, 255, 255, 0.65);
+        }
+
+        .debate-select {
+          min-height: 36px;
+          border-radius: 0.4rem;
+          border: 1px solid rgba(255, 255, 255, 0.2);
+          background: rgba(20, 20, 20, 0.9);
+          color: #fff;
+          font-size: 0.74rem;
+          padding: 0.2rem 0.45rem;
         }
 
         .model-indicator-button {
@@ -1411,6 +1540,20 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
           color: #FF6B6B;
         }
         .message-time { color: rgba(255, 255, 255, 0.4); margin-left: auto; }
+        .debate-badge-group { display: inline-flex; flex-wrap: wrap; gap: 0.35rem; }
+        .debate-badge {
+          font-size: 0.64rem;
+          padding: 0.12rem 0.35rem;
+          border-radius: 0.28rem;
+          border: 1px solid rgba(255, 196, 70, 0.45);
+          background: rgba(255, 196, 70, 0.15);
+          color: rgba(255, 226, 160, 0.95);
+          text-transform: lowercase;
+          max-width: 220px;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
 
         .message-image-container { margin: 0.5rem 0; max-width: 300px; }
         .message-image { max-width: 100%; max-height: 300px; border-radius: 0.5rem; border: 1px solid rgba(255, 255, 255, 0.1); }
@@ -1525,6 +1668,14 @@ export const ChatInterface: React.FC<ChatInterfaceProps> = ({ user, onSignOut })
         .draft-remove-btn:hover { background: rgba(255, 107, 107, 0.2); color: #FF6B6B; }
 
         .input-row { display: flex; gap: 0.625rem; align-items: flex-end; }
+        .send-validation-error {
+          color: rgba(255, 159, 159, 0.95);
+          font-size: 0.74rem;
+          border: 1px solid rgba(255, 107, 107, 0.35);
+          background: rgba(255, 107, 107, 0.14);
+          border-radius: 0.45rem;
+          padding: 0.4rem 0.55rem;
+        }
 
         .chat-input {
           flex: 1;

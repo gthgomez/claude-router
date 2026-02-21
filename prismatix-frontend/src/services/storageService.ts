@@ -105,6 +105,11 @@ async function initVideoUpload(params: {
 }): Promise<VideoInitResponse> {
   const { intakeEndpoint } = requireVideoEndpoints();
   const token = await getAccessToken();
+  console.log('[Storage][Video] Init upload:', {
+    fileName: params.file.name,
+    mimeType: params.file.type || 'unknown',
+    sizeBytes: params.file.size,
+  });
 
   const response = await fetch(`${intakeEndpoint}/init`, {
     method: 'POST',
@@ -199,9 +204,12 @@ export async function uploadVideoAttachment(
   conversationId: string,
   onProgress?: (progressPercent: number) => void,
 ): Promise<VideoUploadResult> {
+  console.log('[Storage][Video] Uploading to signed URL for:', file.name);
   const init = await initVideoUpload({ file, conversationId });
   await uploadViaSignedUrl(init.signedUploadUrl, file, onProgress);
+  console.log('[Storage][Video] Signed upload complete. Finalizing asset:', init.assetId);
   await completeVideoUpload(init.assetId);
+  console.log('[Storage][Video] Finalized asset:', init.assetId);
   return {
     assetId: init.assetId,
     status: 'uploaded',

@@ -7,6 +7,8 @@ import {
   assertStringIncludes,
 } from 'https://deno.land/std@0.168.0/testing/asserts.ts';
 
+import { createNormalizedProxyStream } from '../supabase/functions/router/sse_normalizer.ts';
+
 import {
   DEFAULT_DEBATE_THRESHOLD,
   getDebatePlan,
@@ -14,12 +16,40 @@ import {
 } from '../supabase/functions/router/debate_profiles.ts';
 
 import { calculatePreFlightCost } from '../supabase/functions/router/cost_engine.ts';
+import type { Message, RouteDecision } from '../supabase/functions/router/router_logic.ts';
+import {
+  buildAnthropicStreamPayload,
+  buildGoogleStreamPayload,
+  buildOpenAILegacyStreamPayload,
+  buildOpenAIStreamPayload,
+} from '../supabase/functions/router/provider_payloads.ts';
+import {
+  buildDebateHeaders,
+  computeDebateEligibility,
+  runDebateStageWithTimeout,
+  selectDebateWorkerMaxTokens,
+  serializeMessagesForCost,
+} from '../supabase/functions/router/debate_runtime.ts';
 
 import {
   buildChallengerPrompt,
   buildSynthesisPrompt,
   type ChallengerOutput,
 } from '../supabase/functions/router/debate_prompts.ts';
+
+async function readStreamText(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const decoder = new TextDecoder();
+  const reader = stream.getReader();
+  let out = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    out += decoder.decode(value, { stream: true });
+  }
+  out += decoder.decode(new Uint8Array(), { stream: false });
+  return out;
+}
 
 // ============================================================================
 // Eligibility / profile tests
@@ -30,13 +60,13 @@ Deno.test('DEFAULT_DEBATE_THRESHOLD is 85', () => {
 });
 
 Deno.test('getDebatePlan: general profile returns ≤2 challengers', () => {
-  const plan = getDebatePlan('general', 'sonnet-4.5');
+  const plan = getDebatePlan('general', 'sonnet-4.6');
   assertEquals(plan.challengers.length <= 2, true);
   assertEquals(plan.profile, 'general');
 });
 
 Deno.test('getDebatePlan: code profile returns challengers', () => {
-  const plan = getDebatePlan('code', 'sonnet-4.5');
+  const plan = getDebatePlan('code', 'sonnet-4.6');
   assertEquals(plan.profile, 'code');
   assertEquals(plan.challengers.length >= 1, true);
 });
@@ -56,30 +86,30 @@ Deno.test('getDebatePlan: code primary exclusion', () => {
 });
 
 Deno.test('getDebatePlan: maxChallengerChars is bounded ≤3000', () => {
-  const generalPlan = getDebatePlan('general', 'sonnet-4.5');
-  const codePlan = getDebatePlan('code', 'sonnet-4.5');
+  const generalPlan = getDebatePlan('general', 'sonnet-4.6');
+  const codePlan = getDebatePlan('code', 'sonnet-4.6');
   assertEquals(generalPlan.maxChallengerChars <= 3000, true);
   assertEquals(codePlan.maxChallengerChars <= 3000, true);
 });
 
 Deno.test('getDebatePlan: code profile maxChallengerChars > general maxChallengerChars', () => {
   // Code critique needs slightly more room for code snippets.
-  const generalPlan = getDebatePlan('general', 'opus-4.5');
-  const codePlan = getDebatePlan('code', 'opus-4.5');
+  const generalPlan = getDebatePlan('general', 'opus-4.6');
+  const codePlan = getDebatePlan('code', 'opus-4.6');
   assertEquals(codePlan.maxChallengerChars >= generalPlan.maxChallengerChars, true);
 });
 
 Deno.test('getDebatePlan: all challenger tiers are valid RouterModel keys', () => {
   const validTiers = new Set([
     'haiku-4.5',
-    'sonnet-4.5',
-    'opus-4.5',
+    'sonnet-4.6',
+    'opus-4.6',
     'gpt-5-mini',
     'gemini-3-flash',
-    'gemini-3-pro',
+    'gemini-3.1-pro',
   ]);
-  for (const profile of ['general', 'code'] as DebateProfile[]) {
-    const plan = getDebatePlan(profile, 'sonnet-4.5');
+  for (const profile of ['general', 'code', 'video_ui'] as DebateProfile[]) {
+    const plan = getDebatePlan(profile, 'sonnet-4.6');
     for (const c of plan.challengers) {
       assertEquals(
         validTiers.has(c.modelTier),
@@ -88,6 +118,16 @@ Deno.test('getDebatePlan: all challenger tiers are valid RouterModel keys', () =
       );
     }
   }
+});
+
+Deno.test('getDebatePlan: video_ui profile includes the required three roles', () => {
+  const plan = getDebatePlan('video_ui', 'sonnet-4.6');
+  const roles = plan.challengers.map((c) => c.role);
+  assertEquals(plan.profile, 'video_ui');
+  assertEquals(plan.challengers.length, 3);
+  assertEquals(roles.includes('UI Designer Critic'), true);
+  assertEquals(roles.includes('Product QA / UX Researcher'), true);
+  assertEquals(roles.includes('Customer Persona'), true);
 });
 
 // ============================================================================
@@ -112,6 +152,12 @@ Deno.test('buildChallengerPrompt: code profile includes correctness focus', () =
 Deno.test('buildChallengerPrompt: general profile includes reasoning focus', () => {
   const prompt = buildChallengerPrompt('general', 'skeptic', 'Should I use microservices?');
   assertStringIncludes(prompt, 'reasoning');
+});
+
+Deno.test('buildChallengerPrompt: video_ui profile includes notes-only constraint', () => {
+  const prompt = buildChallengerPrompt('video_ui', 'UI Designer Critic', 'VIDEO_NOTES_JSON: {...}');
+  assertStringIncludes(prompt, 'VIDEO_NOTES_JSON');
+  assertStringIncludes(prompt, 'do NOT infer unseen frames');
 });
 
 Deno.test('buildSynthesisPrompt: includes all challenger texts', () => {
@@ -142,6 +188,14 @@ Deno.test('buildSynthesisPrompt: long challenger text is clamped to maxPerOutput
   // After clamping, the prompt should not contain the full 5000-char string.
   const overflowChunk = 'x'.repeat(2100);
   assertEquals(prompt.includes(overflowChunk), false);
+});
+
+Deno.test('buildSynthesisPrompt: video_ui profile requests backlog with acceptance criteria and test plan', () => {
+  const outputs: ChallengerOutput[] = [{ role: 'UI Designer Critic', modelTier: 'gemini-3.1-pro', text: 'Issue at 00:12' }];
+  const prompt = buildSynthesisPrompt('video_ui', 'Review this UI', outputs, 1800);
+  assertStringIncludes(prompt, 'prioritized product backlog');
+  assertStringIncludes(prompt, 'acceptance criteria');
+  assertStringIncludes(prompt, 'next usability test plan');
 });
 
 // ============================================================================
@@ -195,7 +249,7 @@ Deno.test('Header contract: required existing header names are unchanged', () =>
   ];
 
   // Verify none were renamed into debate headers (no overlap).
-  const debateHeaders = ['X-Debate-Mode', 'X-Debate-Profile', 'X-Debate-Trigger', 'X-Debate-Cost-Note'];
+  const debateHeaders = ['X-Debate-Mode', 'X-Debate-Profile', 'X-Debate-Trigger', 'X-Debate-Model', 'X-Debate-Cost-Note'];
   for (const h of required) {
     assertEquals(debateHeaders.includes(h), false, `Existing header ${h} must not appear in debate headers`);
   }
@@ -217,7 +271,7 @@ Deno.test('Debate headers are additive only (no collision with existing headers)
     'X-Cost-Estimate-USD',
     'X-Cost-Pricing-Version',
   ]);
-  const debateNew = ['X-Debate-Mode', 'X-Debate-Profile', 'X-Debate-Trigger', 'X-Debate-Cost-Note'];
+  const debateNew = ['X-Debate-Mode', 'X-Debate-Profile', 'X-Debate-Trigger', 'X-Debate-Model', 'X-Debate-Cost-Note'];
   for (const h of debateNew) {
     assertEquals(existing.has(h), false, `New debate header ${h} must not collide with existing headers`);
   }
@@ -318,12 +372,17 @@ Deno.test('Debate explicit: mode=debate triggers regardless of auto flag', () =>
 
 Deno.test('X-Model-Override: explicit debate request produces debate:<profile> override value', () => {
   // Simulate parseDebateRequest("debate", undefined, "code")
-  const mode = 'debate';
   const profile = 'code';
   const overrideHeaderValue = `debate:${profile}`;
 
   assertEquals(overrideHeaderValue, 'debate:code');
   assertEquals(overrideHeaderValue.startsWith('debate:'), true);
+});
+
+Deno.test('X-Model-Override: debate:video_ui compatibility format is preserved', () => {
+  const overrideHeaderValue = 'debate:video_ui';
+  assertEquals(overrideHeaderValue.startsWith('debate:'), true);
+  assertEquals(overrideHeaderValue.split(':')[1], 'video_ui');
 });
 
 Deno.test('X-Model-Override: non-debate path preserves existing override semantics', () => {
@@ -510,14 +569,14 @@ Deno.test('Patch D: longer synthesis context produces higher cost estimate', () 
 
 Deno.test('Patch D: cost recompute uses synthesis model tier (not challenger tier)', () => {
   // Synthesis runs on the primary decision model; cost must reflect that tier.
-  const synthesisTier = 'sonnet-4.5'; // primary (expensive)
+  const synthesisTier = 'sonnet-4.6'; // primary (expensive)
   const challengerTier = 'gpt-5-mini'; // challenger (cheap)
   const context = 'user: long question with debate notes included ' + 'x'.repeat(200);
 
   const synthesisCost = calculatePreFlightCost(synthesisTier, context, 0, 0);
   const challengerCost = calculatePreFlightCost(challengerTier, context, 0, 0);
 
-  // Synthesis on sonnet-4.5 should cost more than the same context on gpt-5-mini.
+  // Synthesis on sonnet-4.6 should cost more than the same context on gpt-5-mini.
   assertEquals(synthesisCost.estimatedUsd > challengerCost.estimatedUsd, true);
 });
 
@@ -530,4 +589,264 @@ Deno.test('Patch D: cost estimate fallback to preFlightCost when debate inactive
     : preFlightEstimate;
 
   assertEquals(effectiveCostEstimateUsd, preFlightEstimate);
+});
+
+// ============================================================================
+// Runtime helper regression tests (index.ts-backed behavior)
+// ============================================================================
+
+Deno.test('Runtime SSE helper: emits normalized deltas and exactly one [DONE]', async () => {
+  const encoder = new TextEncoder();
+  const upstreamBody = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode('data: {"piece":"alpha"}\n\n'));
+      controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      controller.enqueue(encoder.encode('data: {"piece":"beta"}\n\n'));
+      controller.close();
+    },
+  });
+
+  const normalized = createNormalizedProxyStream({
+    upstreamBody,
+    extractDeltas: (payload: unknown) => {
+      const p = payload as { piece?: string };
+      return typeof p.piece === 'string' ? [p.piece] : [];
+    },
+    onDelta: () => {},
+    onComplete: () => {},
+  });
+
+  const output = await readStreamText(normalized);
+  const lines = output
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('data:'));
+
+  const doneCount = lines.filter((line) => line === 'data: [DONE]').length;
+  assertEquals(doneCount, 1);
+
+  const deltaLines = lines.filter((line) => line !== 'data: [DONE]');
+  assertEquals(deltaLines.length, 2);
+  for (const line of deltaLines) {
+    const payload = JSON.parse(line.slice('data: '.length)) as {
+      type: string;
+      delta?: { text?: string };
+    };
+    assertEquals(payload.type, 'content_block_delta');
+    assertEquals(typeof payload.delta?.text, 'string');
+  }
+});
+
+Deno.test('Runtime worker cap: provider payloads map budgetCap to output-token params', () => {
+  const messages: Message[] = [{ role: 'user', content: 'hi' }];
+
+  const anthropicDecision: RouteDecision = {
+    provider: 'anthropic',
+    model: 'claude-sonnet-4-6',
+    modelTier: 'sonnet-4.6',
+    budgetCap: 400,
+    rationaleTag: 'test',
+    complexityScore: 90,
+  };
+  const anthropicPayload = buildAnthropicStreamPayload(anthropicDecision, messages, []);
+  assertEquals(anthropicPayload.max_tokens, 400);
+
+  const openaiDecision: RouteDecision = {
+    provider: 'openai',
+    model: 'gpt-5-mini',
+    modelTier: 'gpt-5-mini',
+    budgetCap: 400,
+    rationaleTag: 'test',
+    complexityScore: 90,
+  };
+  const openaiPayload = buildOpenAIStreamPayload(openaiDecision, messages, []);
+  const openaiFallbackPayload = buildOpenAILegacyStreamPayload(openaiDecision, messages, []);
+  assertEquals(openaiPayload.max_completion_tokens, 400);
+  assertEquals(openaiFallbackPayload.max_tokens, 400);
+
+  const googleDecision: RouteDecision = {
+    provider: 'google',
+    model: 'gemini-3-flash-preview',
+    modelTier: 'gemini-3-flash',
+    budgetCap: 400,
+    rationaleTag: 'test',
+    complexityScore: 90,
+  };
+  const googlePayload = buildGoogleStreamPayload(googleDecision, messages, [], true, 'high');
+  const generationConfig = googlePayload.generationConfig as { maxOutputTokens?: number };
+  assertEquals(generationConfig.maxOutputTokens, 400);
+});
+
+Deno.test('Runtime worker cap selector: code profile uses higher cap', () => {
+  assertEquals(selectDebateWorkerMaxTokens('general', 400, 700, 420), 400);
+  assertEquals(selectDebateWorkerMaxTokens('code', 400, 700, 420), 700);
+  assertEquals(selectDebateWorkerMaxTokens('video_ui', 400, 700, 420), 420);
+});
+
+Deno.test('Runtime media gate: explicit and auto debate are blocked by image/video media', () => {
+  const explicitImageBlocked = computeDebateEligibility({
+    profile: 'general',
+    enableDebateMode: true,
+    enableDebateAuto: true,
+    debateRequested: true,
+    hasImages: true,
+    hasVideoAssets: false,
+    complexityScore: 95,
+    threshold: 85,
+  });
+  assertEquals(explicitImageBlocked.doDebate, false);
+
+  const autoVideoBlocked = computeDebateEligibility({
+    profile: 'general',
+    enableDebateMode: true,
+    enableDebateAuto: true,
+    debateRequested: false,
+    hasImages: false,
+    hasVideoAssets: true,
+    complexityScore: 95,
+    threshold: 85,
+  });
+  assertEquals(autoVideoBlocked.shouldAutoDebate, false);
+  assertEquals(autoVideoBlocked.doDebate, false);
+});
+
+Deno.test('Runtime video_ui gate: runs only for explicit requests with video and no images', () => {
+  const eligible = computeDebateEligibility({
+    profile: 'video_ui',
+    enableDebateMode: true,
+    enableDebateAuto: true,
+    debateRequested: true,
+    hasImages: false,
+    hasVideoAssets: true,
+    complexityScore: 95,
+    threshold: 85,
+  });
+  assertEquals(eligible.doDebate, true);
+  assertEquals(eligible.shouldAutoDebate, false);
+  assertEquals(eligible.trigger, 'explicit');
+
+  const noVideo = computeDebateEligibility({
+    profile: 'video_ui',
+    enableDebateMode: true,
+    enableDebateAuto: true,
+    debateRequested: true,
+    hasImages: false,
+    hasVideoAssets: false,
+    complexityScore: 95,
+    threshold: 85,
+  });
+  assertEquals(noVideo.doDebate, false);
+
+  const withImage = computeDebateEligibility({
+    profile: 'video_ui',
+    enableDebateMode: true,
+    enableDebateAuto: true,
+    debateRequested: true,
+    hasImages: true,
+    hasVideoAssets: true,
+    complexityScore: 95,
+    threshold: 85,
+  });
+  assertEquals(withImage.doDebate, false);
+});
+
+Deno.test('Runtime debate headers: emitted only when debateActive=true', () => {
+  const absent = buildDebateHeaders({
+    debateActive: false,
+    debateProfile: 'general',
+    debateTrigger: 'off',
+  });
+  assertEquals(Object.keys(absent).length, 0);
+
+  const present = buildDebateHeaders({
+    debateActive: true,
+    debateProfile: 'code',
+    debateTrigger: 'auto',
+    debateModelTier: 'sonnet-4.6',
+  });
+  assertEquals(present['X-Debate-Mode'], 'true');
+  assertEquals(present['X-Debate-Profile'], 'code');
+  assertEquals(present['X-Debate-Trigger'], 'auto');
+  assertEquals(present['X-Debate-Model'], 'sonnet-4.6');
+  assertEquals(present['X-Debate-Cost-Note'], 'partial');
+});
+
+Deno.test('Runtime debate headers: requested-but-media-blocked path stays header-absent', () => {
+  const blocked = computeDebateEligibility({
+    profile: 'general',
+    enableDebateMode: true,
+    enableDebateAuto: true,
+    debateRequested: true,
+    hasImages: false,
+    hasVideoAssets: true,
+    complexityScore: 90,
+    threshold: 85,
+  });
+  const headers = buildDebateHeaders({
+    debateActive: blocked.doDebate,
+    debateProfile: 'general',
+    debateTrigger: blocked.trigger,
+  });
+  assertEquals(Object.keys(headers).length, 0);
+});
+
+Deno.test('Runtime debate headers: explicit-request fallback path stays header-absent', () => {
+  const headers = buildDebateHeaders({
+    debateActive: false,
+    debateProfile: 'code',
+    debateTrigger: 'explicit',
+  });
+  assertEquals(Object.keys(headers).length, 0);
+});
+
+Deno.test('Runtime debate timeout: stage timeout falls back cleanly (null result)', async () => {
+  const parent = new AbortController();
+  const result = await runDebateStageWithTimeout({
+    parentSignal: parent.signal,
+    timeoutMs: 20,
+    run: async (signal) =>
+      await new Promise<string>((resolve, reject) => {
+        const tid = setTimeout(() => resolve('should-not-complete'), 60);
+        signal.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(tid);
+            reject(new DOMException('debate timeout', 'AbortError'));
+          },
+          { once: true },
+        );
+      }),
+  });
+  assertEquals(result, null);
+
+  const headers = buildDebateHeaders({
+    debateActive: result !== null,
+    debateProfile: 'video_ui',
+    debateTrigger: 'explicit',
+  });
+  assertEquals(Object.keys(headers).length, 0);
+});
+
+Deno.test('Runtime synthesis cost input: deterministic role+content serialization (no object join)', () => {
+  const messages: Message[] = [
+    { role: 'user', content: 'first' },
+    { role: 'assistant', content: 'second' },
+  ];
+  const serialized = serializeMessagesForCost(messages);
+  assertEquals(serialized, 'user: first\nassistant: second');
+  assertEquals(serialized.includes('[object Object]'), false);
+});
+
+Deno.test('Runtime synthesis-only cost estimate increases with added synthesis context', () => {
+  const baseMessages: Message[] = [{ role: 'user', content: 'hello' }];
+  const synthesisMessages: Message[] = [
+    ...baseMessages,
+    { role: 'user', content: 'debate-note '.repeat(80) },
+  ];
+
+  const base = calculatePreFlightCost('gpt-5-mini', serializeMessagesForCost(baseMessages), 0, 0);
+  const synthesis = calculatePreFlightCost('gpt-5-mini', serializeMessagesForCost(synthesisMessages), 0, 0);
+
+  assertEquals(synthesis.promptTokens > base.promptTokens, true);
+  assertEquals(synthesis.estimatedUsd > base.estimatedUsd, true);
 });

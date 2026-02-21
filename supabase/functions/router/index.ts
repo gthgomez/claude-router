@@ -13,9 +13,6 @@ import {
   type RouteDecision,
   type RouterModel,
   type RouterParams,
-  transformMessagesForAnthropic,
-  transformMessagesForGoogle,
-  transformMessagesForOpenAI,
 } from './router_logic.ts';
 import { calculateCostBreakdown, calculatePreFlightCost } from './cost_engine.ts';
 import {
@@ -29,6 +26,21 @@ import {
   buildSynthesisPrompt,
   type ChallengerOutput,
 } from './debate_prompts.ts';
+import { createNormalizedProxyStream } from './sse_normalizer.ts';
+import {
+  type GeminiFlashThinkingLevel,
+  buildAnthropicStreamPayload,
+  buildGoogleStreamPayload,
+  buildOpenAILegacyStreamPayload,
+  buildOpenAIStreamPayload,
+} from './provider_payloads.ts';
+import {
+  buildDebateHeaders,
+  computeDebateEligibility,
+  runDebateStageWithTimeout,
+  selectDebateWorkerMaxTokens,
+  serializeMessagesForCost,
+} from './debate_runtime.ts';
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -114,12 +126,28 @@ interface MemoryRetrievalResult {
   tokenCount: number;
 }
 
-type GeminiFlashThinkingLevel = 'low' | 'high';
-
 interface VideoAssetReadyRecord {
   id: string;
   user_id: string;
   status: 'pending_upload' | 'uploaded' | 'processing' | 'ready' | 'failed' | 'expired';
+}
+
+interface VideoArtifactRecord {
+  asset_id: string;
+  kind: 'thumbnail' | 'frame' | 'transcript' | 'summary';
+  seq: number | null;
+  text_content: string | null;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+}
+
+interface VideoAssetContextRecord {
+  id: string;
+  status: 'pending_upload' | 'uploaded' | 'processing' | 'ready' | 'failed' | 'expired';
+  duration_ms: number | null;
+  width: number | null;
+  height: number | null;
+  updated_at: string | null;
 }
 
 // ============================================================================
@@ -131,7 +159,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
   'Access-Control-Expose-Headers':
-    'X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level, X-Memory-Hits, X-Memory-Tokens, X-Cost-Estimate-USD, X-Cost-Pricing-Version, X-Debate-Mode, X-Debate-Profile, X-Debate-Trigger, X-Debate-Cost-Note',
+    'X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level, X-Memory-Hits, X-Memory-Tokens, X-Cost-Estimate-USD, X-Cost-Pricing-Version, X-Debate-Mode, X-Debate-Profile, X-Debate-Trigger, X-Debate-Model, X-Debate-Cost-Note',
 };
 
 const FUNCTION_TIMEOUT_MS = 55000;
@@ -141,6 +169,8 @@ const MAX_VIDEO_ASSETS_PER_REQUEST = 4;
 const VIDEO_IMAGE_TOKEN_ESTIMATE = 1600;
 const VIDEO_TRANSCRIPT_TOKEN_ESTIMATE = 3000;
 const VIDEO_MAX_FRAME_TOKENS = 8 * VIDEO_IMAGE_TOKEN_ESTIMATE;
+const VIDEO_CONTEXT_MAX_CHARS = 5000;
+const VIDEO_CONTEXT_MAX_ARTIFACT_ROWS = 36;
 const DEV_MODE = Deno.env.get('DEV_MODE') === 'true';
 
 const ANTHROPIC_API_KEY = Deno.env.get('ANTHROPIC_API_KEY') || '';
@@ -173,6 +203,10 @@ const DEBATE_COMPLEXITY_THRESHOLD = Number(Deno.env.get('DEBATE_COMPLEXITY_THRES
 // Per-challenger token budget caps — prevents cost runaway regardless of text truncation.
 const DEBATE_WORKER_MAX_TOKENS_GENERAL = Number(Deno.env.get('DEBATE_WORKER_MAX_TOKENS_GENERAL') || '') || 400;
 const DEBATE_WORKER_MAX_TOKENS_CODE = Number(Deno.env.get('DEBATE_WORKER_MAX_TOKENS_CODE') || '') || 700;
+const DEBATE_WORKER_MAX_TOKENS_VIDEO_UI = Number(Deno.env.get('DEBATE_WORKER_MAX_TOKENS_VIDEO_UI') || '') || 420;
+const DEBATE_VIDEO_UI_SYNTHESIS_MAX_TOKENS = Number(Deno.env.get('DEBATE_VIDEO_UI_SYNTHESIS_MAX_TOKENS') || '') || 900;
+const DEBATE_VIDEO_UI_STAGE_TIMEOUT_MS = Number(Deno.env.get('DEBATE_VIDEO_UI_STAGE_TIMEOUT_MS') || '') || 18000;
+const DEBATE_VIDEO_UI_NOTES_MAX_CHARS = Number(Deno.env.get('DEBATE_VIDEO_UI_NOTES_MAX_CHARS') || '') || 8000;
 
 const GOOGLE_MODELS_CACHE_TTL_MS = 10 * 60 * 1000;
 let googleModelsCache: { fetchedAt: number; models: GoogleModelRecord[] } | null = null;
@@ -257,7 +291,7 @@ function hasAtLeastOneProviderConfigured(): boolean {
 function fallbackModel(): RouterModel | undefined {
   if (isProviderReady('google')) return 'gemini-3-flash';
   if (isProviderReady('openai')) return 'gpt-5-mini';
-  if (isProviderReady('anthropic')) return 'sonnet-4.5';
+  if (isProviderReady('anthropic')) return 'sonnet-4.6';
   return undefined;
 }
 
@@ -324,8 +358,37 @@ function normalizeDecisionAgainstProviderAvailability(
 
 function normalizeDebateProfile(input?: string): DebateProfile {
   const v = String(input || '').trim().toLowerCase();
+  if (v === 'video_ui' || v === 'video-ui' || v === 'videoui') return 'video_ui';
   if (v === 'code' || v === 'coding') return 'code';
   return 'general';
+}
+
+function parseVideoUiModelLadder(input?: string): RouterModel[] {
+  const fallback: RouterModel[] = ['gemini-3.1-pro', 'gemini-3-flash'];
+  const raw = String(input || '')
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+  if (raw.length === 0) return fallback;
+
+  const out: RouterModel[] = [];
+  for (const item of raw) {
+    // Accept both new and old env var values for backwards compat
+    if (item === 'gemini-3.1-pro' || item === 'gemini-3-pro') out.push('gemini-3.1-pro');
+    if (item === 'gemini-3-flash') out.push('gemini-3-flash');
+  }
+  return out.length > 0 ? out : fallback;
+}
+
+const DEBATE_VIDEO_UI_MODEL_LADDER = parseVideoUiModelLadder(
+  Deno.env.get('DEBATE_VIDEO_UI_MODEL_LADDER'),
+);
+
+function resolveVideoUiDebateModelTier(): RouterModel | null {
+  for (const tier of DEBATE_VIDEO_UI_MODEL_LADDER) {
+    if (isProviderReadyForModelTier(tier)) return tier;
+  }
+  return null;
 }
 
 function parseDebateRequest(inputMode?: string, rawModelOverride?: string, profile?: string): {
@@ -351,7 +414,7 @@ function parseDebateRequest(inputMode?: string, rawModelOverride?: string, profi
     };
   }
 
-  // Compatibility: allow modelOverride = "debate" or "debate:code"
+  // Compatibility: allow modelOverride = "debate" or "debate:<profile>"
   if (raw === 'debate' || raw.startsWith('debate:')) {
     const maybeProfile = raw.split(':')[1] || '';
     const pp = normalizeDebateProfile(maybeProfile);
@@ -371,6 +434,14 @@ function parseDebateRequest(inputMode?: string, rawModelOverride?: string, profi
     suppressModelOverride: false,
     overrideHeaderValue: '',
   };
+}
+
+function tryParseJson(input: string): unknown | undefined {
+  try {
+    return JSON.parse(input);
+  } catch {
+    return undefined;
+  }
 }
 
 async function consumeUpstreamToText(
@@ -432,6 +503,8 @@ function isProviderReadyForModelTier(modelTier: RouterModel): boolean {
 interface DebateRunResult {
   upstream: UpstreamCallResult;
   synthesisMessages: Message[];
+  debateModelTier: RouterModel;
+  synthesisDecision: RouteDecision;
 }
 
 async function maybeRunDebateMode(params: {
@@ -443,29 +516,61 @@ async function maybeRunDebateMode(params: {
   geminiFlashThinkingLevel: GeminiFlashThinkingLevel;
   debateProfile: DebateProfile;
   workerMaxTokens: number;
+  forcedModelTier?: RouterModel;
+  synthesisMaxTokens?: number;
+  videoNotesJson?: string;
 }): Promise<DebateRunResult | null> {
-  // MVP: debate disabled for images or video (avoid multi-model vision/tool complexity).
-  if (params.images.length > 0 || params.hasVideo) return null;
+  const isVideoUi = params.debateProfile === 'video_ui';
+  if (!isVideoUi && (params.images.length > 0 || params.hasVideo)) return null;
+  if (isVideoUi && (params.images.length > 0 || !params.hasVideo || !params.videoNotesJson || !params.forcedModelTier)) {
+    return null;
+  }
 
-  const primaryTier = params.decision.modelTier;
+  const basePrimaryDecision = params.forcedModelTier
+    ? decisionFromModel(
+      params.forcedModelTier,
+      params.decision.complexityScore,
+      `debate-${params.debateProfile}-synthesis`,
+    )
+    : params.decision;
+  const synthesisBudgetCap = params.synthesisMaxTokens
+    ? Math.min(basePrimaryDecision.budgetCap, params.synthesisMaxTokens)
+    : basePrimaryDecision.budgetCap;
+  const synthesisDecision: RouteDecision = {
+    ...basePrimaryDecision,
+    budgetCap: synthesisBudgetCap,
+  };
+
+  const primaryTier = synthesisDecision.modelTier;
   const plan = getDebatePlan(params.debateProfile, primaryTier);
 
   // Readiness gating: every model tier we will call must have provider ready.
   if (!isProviderReadyForModelTier(primaryTier)) return null;
   for (const c of plan.challengers) {
-    if (!isProviderReadyForModelTier(c.modelTier)) return null;
+    const tier = params.forcedModelTier || c.modelTier;
+    if (!isProviderReadyForModelTier(tier)) return null;
   }
 
   // Run challengers in parallel (streaming, consumed to text, bounded timeout).
   const challengerRuns = plan.challengers.map(async (c): Promise<ChallengerOutput | null> => {
     const workerController = new AbortController();
-    const timeoutMs = params.debateProfile === 'code' ? 12000 : 10000;
+    const timeoutMs = params.debateProfile === 'code'
+      ? 12000
+      : params.debateProfile === 'video_ui'
+      ? 9000
+      : 10000;
     const tid = setTimeout(() => workerController.abort(), timeoutMs);
+    const onStageAbort = () => workerController.abort();
+    params.signal.addEventListener('abort', onStageAbort, { once: true });
     try {
+      const baseUserQuery = params.allMessages.at(-1)?.content || '';
+      const enrichedUserQuery = isVideoUi
+        ? `${baseUserQuery}\n\nVIDEO_NOTES_JSON:\n${params.videoNotesJson}`
+        : baseUserQuery;
       const workerPrompt = buildChallengerPrompt(
         params.debateProfile,
         c.role,
-        params.allMessages.at(-1)?.content || '',
+        enrichedUserQuery,
       );
       const workerMessages: Message[] = [
         // Keep context small: last 6 turns + challenger prompt as final user msg.
@@ -474,8 +579,9 @@ async function maybeRunDebateMode(params: {
       ];
 
       // Cap challenger budget to prevent cost runaway; text truncation alone is insufficient.
+      const workerTier = params.forcedModelTier || c.modelTier;
       const workerDecision: RouteDecision = {
-        ...decisionFromModel(c.modelTier, params.decision.complexityScore, `debate-worker-${c.role}`),
+        ...decisionFromModel(workerTier, params.decision.complexityScore, `debate-worker-${c.role}`),
         budgetCap: params.workerMaxTokens,
       };
 
@@ -493,11 +599,12 @@ async function maybeRunDebateMode(params: {
         plan.maxChallengerChars,
       );
       if (!text) return null;
-      return { role: c.role, modelTier: c.modelTier, text };
+      return { role: c.role, modelTier: workerTier, text };
     } catch {
       return null;
     } finally {
       clearTimeout(tid);
+      params.signal.removeEventListener('abort', onStageAbort);
     }
   });
 
@@ -507,7 +614,10 @@ async function maybeRunDebateMode(params: {
   if (challengerResults.length === 0) return null;
 
   // Synthesis: ask the PRIMARY decision model to produce a final answer using debate notes.
-  const userQuery = params.allMessages.at(-1)?.content || '';
+  const baseUserQuery = params.allMessages.at(-1)?.content || '';
+  const userQuery = isVideoUi
+    ? `${baseUserQuery}\n\nVIDEO_NOTES_JSON:\n${params.videoNotesJson}`
+    : baseUserQuery;
   const synthesisPrompt = buildSynthesisPrompt(
     params.debateProfile,
     userQuery,
@@ -521,14 +631,19 @@ async function maybeRunDebateMode(params: {
   ];
 
   const upstream = await callProviderStream(
-    params.decision,
+    synthesisDecision,
     synthesisMessages,
     [],
     params.signal,
     params.geminiFlashThinkingLevel,
   );
 
-  return { upstream, synthesisMessages };
+  return {
+    upstream,
+    synthesisMessages,
+    debateModelTier: synthesisDecision.modelTier,
+    synthesisDecision,
+  };
 }
 
 // ============================================================================
@@ -645,14 +760,18 @@ function googleAliasScore(alias: string, modelName: string): number {
   if (normalizedAlias === normalizedName) score += 1000;
   if (normalizedName.includes(normalizedAlias)) score += 500;
 
-  if (normalizedAlias === 'gemini-3-flash') {
+  if (normalizedAlias === 'gemini-3-flash' || normalizedAlias === 'gemini-3-flash-preview') {
     if (normalizedName.includes('flash')) score += 300;
     if (normalizedName.includes('gemini-3')) score += 200;
     if (normalizedName.includes('gemini-2.5')) score += 100;
     if (!normalizedName.includes('flash')) score -= 400;
   }
 
-  if (normalizedAlias === 'gemini-3-pro') {
+  if (
+    normalizedAlias === 'gemini-3.1-pro-preview' ||
+    normalizedAlias === 'gemini-3.1-pro' ||
+    normalizedAlias === 'gemini-3-pro'
+  ) {
     if (normalizedName.includes('pro')) score += 300;
     if (normalizedName.includes('gemini-3')) score += 200;
     if (normalizedName.includes('gemini-2.5')) score += 100;
@@ -706,12 +825,7 @@ async function callAnthropic(
       'anthropic-version': '2023-06-01',
       'content-type': 'application/json',
     },
-    body: JSON.stringify({
-      model: decision.model,
-      max_tokens: decision.budgetCap,
-      messages: transformMessagesForAnthropic(allMessages, images),
-      stream: true,
-    }),
+    body: JSON.stringify(buildAnthropicStreamPayload(decision, allMessages, images)),
     signal,
   });
 
@@ -728,7 +842,6 @@ async function callOpenAI(
   images: ImageAttachment[],
   signal: AbortSignal,
 ): Promise<UpstreamCallResult> {
-  const messages = transformMessagesForOpenAI(allMessages, images);
   const endpoint = 'https://api.openai.com/v1/chat/completions';
 
   const doCall = (payload: Record<string, unknown>) =>
@@ -742,21 +855,15 @@ async function callOpenAI(
       signal,
     });
 
-  let openaiResponse = await doCall({
-    model: decision.model,
-    messages,
-    stream: true,
-    max_completion_tokens: decision.budgetCap,
-  });
+  let openaiResponse = await doCall(
+    buildOpenAIStreamPayload(decision, allMessages, images),
+  );
 
   if (openaiResponse.status === 400) {
     const bodyText = await openaiResponse.text();
     if (bodyText.toLowerCase().includes('max_completion_tokens')) {
       openaiResponse = await doCall({
-        model: decision.model,
-        messages,
-        stream: true,
-        max_tokens: decision.budgetCap,
+        ...buildOpenAILegacyStreamPayload(decision, allMessages, images),
       });
     } else {
       openaiResponse = new Response(bodyText, {
@@ -787,7 +894,6 @@ async function callGoogle(
     `:streamGenerateContent?alt=sse&key=${encodeURIComponent(GOOGLE_API_KEY)}`;
 
   const isGeminiFlash = decision.modelTier === 'gemini-3-flash';
-  const toApiThinkingLevel = geminiFlashThinkingLevel === 'low' ? 'LOW' : 'HIGH';
 
   const doCall = (includeThinkingConfig: boolean) =>
     fetch(endpoint, {
@@ -795,19 +901,15 @@ async function callGoogle(
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        contents: transformMessagesForGoogle(allMessages, images),
-        generationConfig: {
-          maxOutputTokens: decision.budgetCap,
-          ...(includeThinkingConfig && isGeminiFlash
-            ? {
-              thinkingConfig: {
-                thinkingLevel: toApiThinkingLevel,
-              },
-            }
-            : {}),
-        },
-      }),
+      body: JSON.stringify(
+        buildGoogleStreamPayload(
+          decision,
+          allMessages,
+          images,
+          includeThinkingConfig,
+          geminiFlashThinkingLevel,
+        ),
+      ),
       signal,
     });
 
@@ -861,118 +963,6 @@ async function callProviderStream(
     case 'google':
       return await callGoogle(decision, allMessages, images, signal, geminiFlashThinkingLevel);
   }
-}
-
-// ============================================================================
-// STREAM NORMALIZATION
-// ============================================================================
-
-function tryParseJson(input: string): unknown | undefined {
-  try {
-    return JSON.parse(input);
-  } catch {
-    return undefined;
-  }
-}
-
-function createNormalizedProxyStream(params: {
-  upstreamBody: ReadableStream<Uint8Array>;
-  extractDeltas: (payload: unknown) => string[];
-  onDelta: (delta: string) => void;
-  onComplete: () => Promise<void> | void;
-}): ReadableStream<Uint8Array> {
-  const decoder = new TextDecoder();
-  const encoder = new TextEncoder();
-  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-  let sseBuffer = '';
-  let completed = false;
-
-  const emitDelta = (
-    controller: ReadableStreamDefaultController<Uint8Array>,
-    delta: string,
-  ) => {
-    if (!delta) return;
-    params.onDelta(delta);
-    controller.enqueue(
-      encoder.encode(
-        `data: ${JSON.stringify({ type: 'content_block_delta', delta: { text: delta } })}\n\n`,
-      ),
-    );
-  };
-
-  const processDataLine = (
-    controller: ReadableStreamDefaultController<Uint8Array>,
-    line: string,
-  ) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) return;
-
-    const dataStr = trimmed.slice(5).trim();
-    if (!dataStr || dataStr === '[DONE]') return;
-
-    const payload = tryParseJson(dataStr);
-    if (!payload) return;
-
-    const deltas = params.extractDeltas(payload);
-    for (const delta of deltas) {
-      emitDelta(controller, delta);
-    }
-  };
-
-  const finalize = async () => {
-    if (completed) return;
-    completed = true;
-    await params.onComplete();
-  };
-
-  return new ReadableStream<Uint8Array>({
-    start(controller) {
-      reader = params.upstreamBody.getReader();
-
-      (async () => {
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!value) continue;
-
-            sseBuffer += decoder.decode(value, { stream: true });
-
-            const lines = sseBuffer.split('\n');
-            sseBuffer = lines.pop() ?? '';
-
-            for (const line of lines) {
-              processDataLine(controller, line);
-            }
-          }
-
-          const tail = sseBuffer.trim();
-          if (tail) processDataLine(controller, tail);
-
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          controller.close();
-        } catch (err) {
-          controller.error(err);
-        } finally {
-          try {
-            decoder.decode(new Uint8Array(), { stream: false });
-          } catch {
-            // ignore
-          }
-          await finalize();
-        }
-      })();
-    },
-    async cancel(reason) {
-      try {
-        if (reader) await reader.cancel(reason);
-      } catch {
-        // ignore
-      } finally {
-        await finalize();
-      }
-    },
-  });
 }
 
 // ============================================================================
@@ -1177,7 +1167,7 @@ async function summarizeConversationWindow(
   }
 
   if (GOOGLE_API_KEY) {
-    const model = await resolveGoogleModelAlias('gemini-3-flash', signal);
+    const model = await resolveGoogleModelAlias(MODEL_REGISTRY['gemini-3-flash'].modelId, signal);
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${
       encodeURIComponent(model)
     }:generateContent?key=${encodeURIComponent(GOOGLE_API_KEY)}`;
@@ -1401,6 +1391,172 @@ async function validateReadyVideoAssets(
   return { ok: true, ids: uniqueIds };
 }
 
+function resolveArtifactTimestampSec(
+  metadata: Record<string, unknown> | null,
+  seq: number | null,
+): number | null {
+  const fromSec = metadata?.timestamp_sec ?? metadata?.timestamp_s ?? metadata?.time_sec;
+  if (typeof fromSec === 'number' && Number.isFinite(fromSec) && fromSec >= 0) return fromSec;
+
+  const fromMs = metadata?.timestamp_ms ?? metadata?.time_ms;
+  if (typeof fromMs === 'number' && Number.isFinite(fromMs) && fromMs >= 0) return fromMs / 1000;
+
+  if (typeof seq === 'number' && Number.isFinite(seq) && seq >= 0) {
+    // Heuristic fallback only when artifact metadata doesn't include a timestamp.
+    return seq * 5;
+  }
+  return null;
+}
+
+function clampText(input: string, maxChars: number): string {
+  if (input.length <= maxChars) return input;
+  return `${input.slice(0, maxChars)}...`;
+}
+
+function compactVideoStatusLine(asset: VideoAssetContextRecord): string {
+  const durationSec = typeof asset.duration_ms === 'number' && Number.isFinite(asset.duration_ms)
+    ? Math.max(0, Math.round(asset.duration_ms / 1000))
+    : null;
+  const dim = asset.width && asset.height ? `${asset.width}x${asset.height}` : 'unknown-dimensions';
+  const durationLabel = durationSec !== null ? `${durationSec}s` : 'unknown-duration';
+  return `asset=${asset.id} status=${asset.status} duration=${durationLabel} dimensions=${dim}`;
+}
+
+function compactArtifactLine(row: VideoArtifactRecord): string | null {
+  const textFromMetadata = typeof row.metadata?.caption === 'string'
+    ? row.metadata.caption
+    : typeof row.metadata?.summary === 'string'
+    ? row.metadata.summary
+    : '';
+  const rawText = (row.text_content || textFromMetadata || '').trim();
+  if (!rawText) return null;
+  const timestampSec = resolveArtifactTimestampSec(row.metadata, row.seq);
+  const tsLabel = typeof timestampSec === 'number' ? `t=${timestampSec.toFixed(1)}s ` : '';
+  return `[${row.asset_id}] ${row.kind} ${tsLabel}${clampText(rawText, 240)}`;
+}
+
+async function buildVideoContextBlock(
+  supabase: ReturnType<typeof createClient>,
+  videoAssetIds: string[],
+  maxChars: number,
+): Promise<string> {
+  if (videoAssetIds.length === 0) return '';
+
+  const lines: string[] = [];
+
+  const { data: assetsData, error: assetsError } = await supabase
+    .from('video_assets')
+    .select('id, status, duration_ms, width, height, updated_at')
+    .in('id', videoAssetIds)
+    .order('updated_at', { ascending: false });
+
+  if (assetsError) {
+    console.warn('[Video] asset context lookup failed:', assetsError);
+  } else {
+    const assets = (assetsData || []) as VideoAssetContextRecord[];
+    for (const asset of assets) {
+      lines.push(compactVideoStatusLine(asset));
+    }
+  }
+
+  const { data: artifactsData, error: artifactsError } = await supabase
+    .from('video_artifacts')
+    .select('asset_id, kind, seq, text_content, metadata, created_at')
+    .in('asset_id', videoAssetIds)
+    .order('asset_id', { ascending: true })
+    .order('seq', { ascending: true, nullsFirst: true })
+    .order('created_at', { ascending: true })
+    .limit(VIDEO_CONTEXT_MAX_ARTIFACT_ROWS);
+
+  if (artifactsError) {
+    console.warn('[Video] artifact context lookup failed:', artifactsError);
+  } else {
+    const rows = (artifactsData || []) as VideoArtifactRecord[];
+    for (const row of rows) {
+      const line = compactArtifactLine(row);
+      if (line) lines.push(line);
+    }
+  }
+
+  if (lines.length === 0) {
+    return '';
+  }
+
+  const block = [
+    '### Video Context',
+    'Use these extracted video artifacts as ground truth context.',
+    ...lines,
+    '### End Video Context',
+  ].join('\n');
+
+  return truncateWithEllipsis(block, maxChars);
+}
+
+async function buildVideoUiNotesJson(
+  supabase: ReturnType<typeof createClient>,
+  videoAssetIds: string[],
+  maxChars: number,
+): Promise<string | null> {
+  if (videoAssetIds.length === 0) return null;
+
+  const { data, error } = await supabase
+    .from('video_artifacts')
+    .select('asset_id, kind, seq, text_content, metadata, created_at')
+    .in('asset_id', videoAssetIds)
+    .order('asset_id', { ascending: true })
+    .order('seq', { ascending: true, nullsFirst: true })
+    .order('created_at', { ascending: true });
+
+  if (error) {
+    console.warn('[Debate][video_ui] artifact lookup failed:', error);
+    return null;
+  }
+
+  const rows = (data || []) as VideoArtifactRecord[];
+  const artifacts = rows.slice(0, 48).map((row) => {
+    const textFromMetadata = typeof row.metadata?.caption === 'string'
+      ? row.metadata.caption
+      : typeof row.metadata?.summary === 'string'
+      ? row.metadata.summary
+      : '';
+    const text = clampText((row.text_content || textFromMetadata || '').trim(), 260);
+    return {
+      asset_id: row.asset_id,
+      kind: row.kind,
+      seq: row.seq,
+      timestamp_sec: resolveArtifactTimestampSec(row.metadata, row.seq),
+      created_at: row.created_at,
+      text,
+    };
+  }).filter((a) => a.text.length > 0);
+
+  const payload = {
+    schema_version: 'video_ui_notes_v1',
+    video_asset_ids: videoAssetIds,
+    artifacts,
+    note: 'Use only these extracted notes. Unseen footage should be marked unknown.',
+  };
+
+  let json = JSON.stringify(payload);
+  if (json.length <= maxChars) return json;
+
+  const compact = {
+    schema_version: 'video_ui_notes_v1',
+    video_asset_ids: videoAssetIds,
+    artifacts: artifacts.slice(0, 12).map((a) => ({ ...a, text: clampText(a.text, 120) })),
+    truncated: true,
+  };
+  json = JSON.stringify(compact);
+  if (json.length <= maxChars) return json;
+
+  return JSON.stringify({
+    schema_version: 'video_ui_notes_v1',
+    video_asset_ids: videoAssetIds,
+    artifacts: [],
+    truncated: true,
+  });
+}
+
 async function persistCostLog(
   supabase: ReturnType<typeof createClient>,
   record: CostLogRecord,
@@ -1503,7 +1659,7 @@ Deno.serve(async (req: Request) => {
       geminiFlashThinkingLevel?: string;
       // Debate Mode tool toggle
       mode?: string; // "debate" to enable
-      debateProfile?: string; // "general" | "code"
+      debateProfile?: string; // "general" | "code" | "video_ui"
     };
 
     const contentLengthHeader = req.headers.get('content-length');
@@ -1649,9 +1805,22 @@ Deno.serve(async (req: Request) => {
       console.warn('[Memory] retrieval skipped:', memoryError);
     }
 
-    const effectiveQuery = memoryRetrieval.contextBlock
-      ? `${memoryRetrieval.contextBlock}\n\nCurrent request:\n${query}`
-      : query;
+    let videoContextBlock = '';
+    if (videoValidation.ids.length > 0) {
+      try {
+        videoContextBlock = await buildVideoContextBlock(
+          supabaseClient as unknown as ReturnType<typeof createClient>,
+          videoValidation.ids,
+          VIDEO_CONTEXT_MAX_CHARS,
+        );
+      } catch (videoContextError) {
+        console.warn('[Video] context injection skipped:', videoContextError);
+      }
+    }
+
+    const effectiveQuery = [memoryRetrieval.contextBlock, videoContextBlock, `Current request:\n${query}`]
+      .filter((part) => typeof part === 'string' && part.trim().length > 0)
+      .join('\n\n');
 
     const routerParams: RouterParams = {
       userQuery: query,
@@ -1659,6 +1828,7 @@ Deno.serve(async (req: Request) => {
       platform,
       history,
       images: imageAttachments,
+      hasVideoAssets,
     };
 
     const debateReq = parseDebateRequest(mode, modelOverride, debateProfile);
@@ -1713,39 +1883,60 @@ Deno.serve(async (req: Request) => {
     let debateTriggerEffective: DebateTrigger = 'off';
     let debateOverrideHeader = '';
     let debateSynthesisMessages: Message[] | null = null;
+    let debateModelTierEffective = '';
+    let responseDecision: RouteDecision = decision;
 
     let upstream: UpstreamCallResult;
     try {
-      // Gate debate on any media: images or validated video assets.
-      const hasAnyMedia = hasImages || hasVideoAssets;
-      const shouldAutoDebate = ENABLE_DEBATE_MODE &&
-        ENABLE_DEBATE_AUTO &&
-        !debateReq.requested &&
-        !hasAnyMedia &&
-        decision.complexityScore >= DEBATE_COMPLEXITY_THRESHOLD;
-
-      const doDebate = ENABLE_DEBATE_MODE && (debateReq.requested || shouldAutoDebate) && !hasAnyMedia;
-      const debateTrigger: DebateTrigger = debateReq.requested
-        ? 'explicit'
-        : shouldAutoDebate
-        ? 'auto'
-        : 'off';
+      const debateEligibility = computeDebateEligibility({
+        profile: debateReq.profile,
+        enableDebateMode: ENABLE_DEBATE_MODE,
+        enableDebateAuto: ENABLE_DEBATE_AUTO,
+        debateRequested: debateReq.requested,
+        hasImages,
+        hasVideoAssets,
+        complexityScore: decision.complexityScore,
+        threshold: DEBATE_COMPLEXITY_THRESHOLD,
+      });
 
       // Worker token cap: challenger budget by profile (not synthesis model).
-      const workerMaxTokens = debateReq.profile === 'code'
-        ? DEBATE_WORKER_MAX_TOKENS_CODE
-        : DEBATE_WORKER_MAX_TOKENS_GENERAL;
+      const workerMaxTokens = selectDebateWorkerMaxTokens(
+        debateReq.profile,
+        DEBATE_WORKER_MAX_TOKENS_GENERAL,
+        DEBATE_WORKER_MAX_TOKENS_CODE,
+        DEBATE_WORKER_MAX_TOKENS_VIDEO_UI,
+      );
 
-      if (doDebate) {
-        const debateResult = await maybeRunDebateMode({
-          decision,
-          allMessages,
-          images: imageAttachments,
-          hasVideo: hasVideoAssets,
-          signal: controller.signal,
-          geminiFlashThinkingLevel: normalizedGeminiFlashThinkingLevel,
-          debateProfile: debateReq.profile,
-          workerMaxTokens,
+      if (debateEligibility.doDebate) {
+        const forcedVideoUiTier = debateReq.profile === 'video_ui'
+          ? resolveVideoUiDebateModelTier()
+          : undefined;
+        const videoUiNotesJson = debateReq.profile === 'video_ui' && forcedVideoUiTier
+          ? await buildVideoUiNotesJson(
+            supabaseClient as unknown as ReturnType<typeof createClient>,
+            videoValidation.ids,
+            DEBATE_VIDEO_UI_NOTES_MAX_CHARS,
+          )
+          : undefined;
+
+        const debateResult = await runDebateStageWithTimeout({
+          parentSignal: controller.signal,
+          timeoutMs: debateReq.profile === 'video_ui' ? DEBATE_VIDEO_UI_STAGE_TIMEOUT_MS : 0,
+          run: async (debateStageSignal) => await maybeRunDebateMode({
+            decision,
+            allMessages,
+            images: imageAttachments,
+            hasVideo: hasVideoAssets,
+            signal: debateStageSignal,
+            geminiFlashThinkingLevel: normalizedGeminiFlashThinkingLevel,
+            debateProfile: debateReq.profile,
+            workerMaxTokens,
+            ...(forcedVideoUiTier ? { forcedModelTier: forcedVideoUiTier } : {}),
+            ...(debateReq.profile === 'video_ui'
+              ? { synthesisMaxTokens: DEBATE_VIDEO_UI_SYNTHESIS_MAX_TOKENS }
+              : {}),
+            ...(videoUiNotesJson ? { videoNotesJson: videoUiNotesJson } : {}),
+          }),
         });
         // On failure (no challengers succeeded), fall through silently to the normal path.
         if (debateResult) {
@@ -1753,8 +1944,10 @@ Deno.serve(async (req: Request) => {
           debateSynthesisMessages = debateResult.synthesisMessages;
           debateActive = true;
           debateProfileEffective = debateReq.profile;
-          debateTriggerEffective = debateTrigger;
+          debateTriggerEffective = debateEligibility.trigger;
           debateOverrideHeader = debateReq.requested ? debateReq.overrideHeaderValue : '';
+          debateModelTierEffective = debateResult.debateModelTier;
+          responseDecision = debateResult.synthesisDecision;
         } else {
           upstream = await callProviderStream(
             decision,
@@ -1780,7 +1973,7 @@ Deno.serve(async (req: Request) => {
       return new Response(
         JSON.stringify({
           error: 'Upstream provider error',
-          provider: decision.provider,
+          provider: responseDecision.provider,
           details: message,
         }),
         {
@@ -1793,13 +1986,13 @@ Deno.serve(async (req: Request) => {
     if (!upstream.response.ok) {
       const errorBody = await upstream.response.text();
       console.error(
-        `[Upstream:${decision.provider}] Error ${upstream.response.status}:`,
+        `[Upstream:${responseDecision.provider}] Error ${upstream.response.status}:`,
         errorBody,
       );
       return new Response(
         JSON.stringify({
           error: 'Upstream provider error',
-          provider: decision.provider,
+          provider: responseDecision.provider,
           details: errorBody,
         }),
         {
@@ -1809,7 +2002,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const effectiveModelId = upstream.effectiveModelId || decision.model;
+    const effectiveModelId = upstream.effectiveModelId || responseDecision.model;
 
     const userTokenCount = countTokens(query) +
       countImageTokens(imageAttachments) +
@@ -1820,7 +2013,7 @@ Deno.serve(async (req: Request) => {
       'user',
       query,
       userTokenCount,
-      `${decision.provider}:${effectiveModelId}`,
+      `${responseDecision.provider}:${effectiveModelId}`,
       imageStorageUrl,
     );
 
@@ -1836,8 +2029,8 @@ Deno.serve(async (req: Request) => {
     // Challenger costs remain excluded (noted by X-Debate-Cost-Note: partial).
     const effectiveCostEstimateUsd = debateSynthesisMessages
       ? calculatePreFlightCost(
-          decision.modelTier,
-          debateSynthesisMessages.map((m) => `${m.role}: ${m.content}`).join('\n'),
+          responseDecision.modelTier,
+          serializeMessagesForCost(debateSynthesisMessages),
           0, // synthesis call has no image attachments
           0,
         ).estimatedUsd
@@ -1853,7 +2046,7 @@ Deno.serve(async (req: Request) => {
       },
       onComplete: async () => {
         const assistantTokenCount = countTokens(assistantText);
-        const costBreakdown = calculateCostBreakdown(decision.modelTier, {
+        const costBreakdown = calculateCostBreakdown(responseDecision.modelTier, {
           promptTokens: userTokenCount,
           completionTokens: assistantTokenCount,
           reasoningTokens: 0,
@@ -1864,8 +2057,8 @@ Deno.serve(async (req: Request) => {
           {
             user_id: userId,
             conversation_id: conversationId,
-            model: decision.modelTier,
-            provider: decision.provider,
+            model: responseDecision.modelTier,
+            provider: responseDecision.provider,
             input_tokens: costBreakdown.promptTokens,
             output_tokens: costBreakdown.completionTokens,
             thinking_tokens: costBreakdown.reasoningTokens,
@@ -1884,7 +2077,7 @@ Deno.serve(async (req: Request) => {
             'assistant',
             assistantText,
             assistantTokenCount,
-            `${decision.provider}:${effectiveModelId}`,
+            `${responseDecision.provider}:${effectiveModelId}`,
           );
           void maybeSummarizeConversationAsync(
             supabaseClient as unknown as ReturnType<typeof createClient>,
@@ -1901,27 +2094,26 @@ Deno.serve(async (req: Request) => {
         ...CORS_HEADERS,
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
-        'X-Router-Model': decision.modelTier,
+        'X-Router-Model': responseDecision.modelTier,
         'X-Router-Model-Id': effectiveModelId,
-        'X-Provider': decision.provider,
+        'X-Provider': responseDecision.provider,
         // Preserve semantics: "override used or auto".
         // If debate was explicitly requested, reflect that in X-Model-Override.
         'X-Model-Override': debateOverrideHeader || normalizedOverride || 'auto',
-        'X-Router-Rationale': decision.rationaleTag,
-        'X-Complexity-Score': decision.complexityScore.toString(),
+        'X-Router-Rationale': responseDecision.rationaleTag,
+        'X-Complexity-Score': responseDecision.complexityScore.toString(),
         'X-Gemini-Thinking-Level': upstream.effectiveGeminiFlashThinkingLevel || 'n/a',
         'X-Memory-Hits': String(memoryRetrieval.hits),
         'X-Memory-Tokens': String(memoryRetrieval.tokenCount),
         'X-Cost-Estimate-USD': effectiveCostEstimateUsd.toFixed(6),
         'X-Cost-Pricing-Version': preFlightCost.pricingVersion,
         // Debate headers are emitted ONLY when debate ran (absent = debate did not run).
-        ...(debateActive ? {
-          'X-Debate-Mode': 'true',
-          'X-Debate-Profile': debateProfileEffective,
-          'X-Debate-Trigger': debateTriggerEffective,
-          // Challenger costs are not included in the estimate; flag it.
-          'X-Debate-Cost-Note': 'partial',
-        } : {}),
+        ...buildDebateHeaders({
+          debateActive,
+          debateProfile: debateProfileEffective,
+          debateTrigger: debateTriggerEffective,
+          ...(debateModelTierEffective ? { debateModelTier: debateModelTierEffective } : {}),
+        }),
       },
     });
   } catch (error) {

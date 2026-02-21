@@ -15,12 +15,12 @@ export const PRICING_REGISTRY: Record<RouterModel, ModelPricing> = {
     outputRatePer1M: 5.0,
     isEstimated: true,
   },
-  'sonnet-4.5': {
+  'sonnet-4.6': {
     inputRatePer1M: 3.0,
     outputRatePer1M: 15.0,
     isEstimated: true,
   },
-  'opus-4.5': {
+  'opus-4.6': {
     inputRatePer1M: 15.0,
     outputRatePer1M: 75.0,
     isEstimated: true,
@@ -36,7 +36,7 @@ export const PRICING_REGISTRY: Record<RouterModel, ModelPricing> = {
     reasoningRatePer1M: 0.4,
     isEstimated: true,
   },
-  'gemini-3-pro': {
+  'gemini-3.1-pro': {
     inputRatePer1M: 1.25,
     outputRatePer1M: 10.0,
     isEstimated: true,

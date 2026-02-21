@@ -4,6 +4,7 @@
 import { supabase } from './lib/supabase';
 import { CONFIG } from './config';
 import type {
+  DebateProfile,
   FileUploadPayload,
   GeminiFlashThinkingLevel,
   Message,
@@ -15,6 +16,19 @@ const STORAGE_KEY = 'prismatix_conversation_id';
 const MAX_ROUTER_QUERY_LENGTH = 50000;
 const QUERY_SAFETY_MARGIN = 2000;
 const MAX_CLIENT_QUERY_LENGTH = MAX_ROUTER_QUERY_LENGTH - QUERY_SAFETY_MARGIN;
+
+export interface DebateRequestOptions {
+  mode?: 'debate';
+  debateProfile?: DebateProfile;
+}
+
+export interface DebateResponseMetadata {
+  debateActive?: boolean;
+  debateProfile?: DebateProfile;
+  debateTrigger?: string;
+  debateModel?: string;
+  debateCostNote?: string;
+}
 
 function base64UrlDecode(input: string): string {
   const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
@@ -168,6 +182,7 @@ export async function askPrismatix(
   attachments: FileUploadPayload[] = [], // ✅ Changed from single to array
   modelOverride?: RouterModel | null,
   geminiFlashThinkingLevel: GeminiFlashThinkingLevel = 'high',
+  debateOptions?: DebateRequestOptions,
 ): Promise<{
   stream: ReadableStream<Uint8Array>;
   model: RouterModel;
@@ -178,6 +193,11 @@ export async function askPrismatix(
   geminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
   costEstimateUsd?: number;
   costPricingVersion?: string;
+  debateActive?: boolean;
+  debateProfile?: DebateProfile;
+  debateTrigger?: string;
+  debateModel?: string;
+  debateCostNote?: string;
 } | null> {
   try {
     const routerEndpoint = CONFIG.ROUTER_ENDPOINT || getEnvVar('VITE_ROUTER_ENDPOINT');
@@ -243,6 +263,10 @@ export async function askPrismatix(
     }
 
     payload.geminiFlashThinkingLevel = geminiFlashThinkingLevel;
+    if (debateOptions?.mode === 'debate' && debateOptions.debateProfile) {
+      payload.mode = 'debate';
+      payload.debateProfile = debateOptions.debateProfile;
+    }
 
     console.log('[smartFetch] Request:', {
       endpoint: routerEndpoint,
@@ -254,6 +278,8 @@ export async function askPrismatix(
       textFileCount: textAttachments.length,
       modelOverride: modelOverride || 'auto',
       geminiFlashThinkingLevel,
+      debateMode: payload.mode || 'off',
+      debateProfile: payload.debateProfile || 'off',
     });
 
     const doFetch = (token: string) => fetch(routerEndpoint, {
@@ -337,12 +363,30 @@ export async function askPrismatix(
     const rationaleHeader = response.headers.get('X-Router-Rationale');
     const costEstimateHeader = response.headers.get('X-Cost-Estimate-USD');
     const costPricingVersion = response.headers.get('X-Cost-Pricing-Version') || undefined;
+    const debateModeHeader = response.headers.get('X-Debate-Mode');
+    const debateProfileHeader = response.headers.get('X-Debate-Profile');
+    const debateTriggerHeader = response.headers.get('X-Debate-Trigger');
+    const debateModelHeader = response.headers.get('X-Debate-Model');
+    const debateCostNoteHeader = response.headers.get('X-Debate-Cost-Note');
     const complexityScore = complexityHeader ? parseInt(complexityHeader, 10) : 50;
     const parsedCostEstimate = costEstimateHeader ? Number(costEstimateHeader) : Number.NaN;
     const costEstimateUsd = Number.isFinite(parsedCostEstimate) ? parsedCostEstimate : undefined;
     const appliedGeminiThinkingLevel = geminiThinkingHeader === 'low' || geminiThinkingHeader === 'high'
       ? geminiThinkingHeader
       : undefined;
+    const normalizedDebateProfile = debateProfileHeader === 'general' ||
+      debateProfileHeader === 'code' ||
+      debateProfileHeader === 'video_ui'
+      ? debateProfileHeader
+      : undefined;
+    const debateModeValue = debateModeHeader?.toLowerCase();
+    const debateMetadata: DebateResponseMetadata = {
+      debateActive: debateModeValue === 'debate' || debateModeValue === 'true' ? true : undefined,
+      debateProfile: normalizedDebateProfile,
+      debateTrigger: debateTriggerHeader || undefined,
+      debateModel: debateModelHeader || undefined,
+      debateCostNote: debateCostNoteHeader || undefined,
+    };
 
     console.log('[smartFetch] Response:', {
       model: modelHeader,
@@ -352,6 +396,11 @@ export async function askPrismatix(
       geminiThinking: appliedGeminiThinkingLevel,
       costEstimateUsd,
       costPricingVersion,
+      debateMode: debateModeHeader || undefined,
+      debateProfile: debateMetadata.debateProfile,
+      debateTrigger: debateMetadata.debateTrigger,
+      debateModel: debateMetadata.debateModel,
+      debateCostNote: debateMetadata.debateCostNote,
       complexity: complexityScore,
       rationale: rationaleHeader,
       status: response.status
@@ -371,6 +420,11 @@ export async function askPrismatix(
       geminiFlashThinkingLevel: appliedGeminiThinkingLevel,
       costEstimateUsd,
       costPricingVersion,
+      debateActive: debateMetadata.debateActive,
+      debateProfile: debateMetadata.debateProfile,
+      debateTrigger: debateMetadata.debateTrigger,
+      debateModel: debateMetadata.debateModel,
+      debateCostNote: debateMetadata.debateCostNote,
     };
   } catch (error) {
     console.error('[smartFetch] Error:', error);
@@ -387,6 +441,7 @@ export async function askPrismatixSync(
   attachments: FileUploadPayload[] = [],
   modelOverride?: RouterModel | null,
   geminiFlashThinkingLevel: GeminiFlashThinkingLevel = 'high',
+  debateOptions?: DebateRequestOptions,
 ): Promise<{
   content: string;
   model: RouterModel;
@@ -397,6 +452,11 @@ export async function askPrismatixSync(
   geminiFlashThinkingLevel?: GeminiFlashThinkingLevel;
   costEstimateUsd?: number;
   costPricingVersion?: string;
+  debateActive?: boolean;
+  debateProfile?: DebateProfile;
+  debateTrigger?: string;
+  debateModel?: string;
+  debateCostNote?: string;
 } | null> {
   const result = await askPrismatix(
     query,
@@ -404,6 +464,7 @@ export async function askPrismatixSync(
     attachments,
     modelOverride,
     geminiFlashThinkingLevel,
+    debateOptions,
   );
   if (!result) return null;
 
@@ -428,6 +489,11 @@ export async function askPrismatixSync(
       geminiFlashThinkingLevel: result.geminiFlashThinkingLevel,
       costEstimateUsd: result.costEstimateUsd,
       costPricingVersion: result.costPricingVersion,
+      debateActive: result.debateActive,
+      debateProfile: result.debateProfile,
+      debateTrigger: result.debateTrigger,
+      debateModel: result.debateModel,
+      debateCostNote: result.debateCostNote,
     };
   } catch (error) {
     console.error('[smartFetch] Stream reading error:', error);

@@ -20,17 +20,17 @@ export const PRICING_REGISTRY: Record<RouterModel, ModelPricing> = {
     sourceRef: 'anthropic-docs',
     isEstimated: true,
   },
-  'sonnet-4.5': {
+  'sonnet-4.6': {
     inputRatePer1M: 3.0,
     outputRatePer1M: 15.0,
-    asOfDate: '2026-02-12',
+    asOfDate: '2026-02-21',
     sourceRef: 'anthropic-docs',
     isEstimated: true,
   },
-  'opus-4.5': {
+  'opus-4.6': {
     inputRatePer1M: 15.0,
     outputRatePer1M: 75.0,
-    asOfDate: '2026-02-12',
+    asOfDate: '2026-02-21',
     sourceRef: 'anthropic-docs',
     isEstimated: true,
   },
@@ -49,10 +49,10 @@ export const PRICING_REGISTRY: Record<RouterModel, ModelPricing> = {
     sourceRef: 'google-pricing',
     isEstimated: true,
   },
-  'gemini-3-pro': {
+  'gemini-3.1-pro': {
     inputRatePer1M: 1.25,
     outputRatePer1M: 10.0,
-    asOfDate: '2026-02-12',
+    asOfDate: '2026-02-21',
     sourceRef: 'google-pricing',
     isEstimated: true,
   },
