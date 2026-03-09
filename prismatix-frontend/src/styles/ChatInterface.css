@@ -406,43 +406,48 @@
 .empty-state {
   display: flex; flex-direction: column;
   align-items: center; justify-content: center;
-  height: 100%; text-align: center;
-  max-width: 600px;
+  min-height: 100%; text-align: center;
+  max-width: 800px;
   margin: 0 auto;
+  padding: var(--spacing-md) 0;
 }
 
 .empty-icon {
-  font-size: 3.5rem;
-  margin-bottom: var(--spacing-lg);
+  font-size: 2.5rem;
+  margin-bottom: var(--spacing-sm);
   filter: drop-shadow(0 0 20px var(--color-primary-dim));
 }
 
 .empty-state h2 {
-  margin: 0 0 var(--spacing-sm);
-  font-size: 1.5rem;
-  font-weight: 600;
+  margin: 0 0 0.25rem;
+  font-size: 1.25rem;
+  font-weight: 700;
   letter-spacing: -0.02em;
+  background: linear-gradient(135deg, #fff, var(--color-primary));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
 .empty-state p {
-  margin: 0 0 var(--spacing-xl);
+  margin: 0 0 var(--spacing-lg);
   color: var(--color-text-dim);
-  max-width: 400px;
-  line-height: 1.6;
-  font-size: 0.9rem;
+  max-width: 450px;
+  line-height: 1.5;
+  font-size: 0.85rem;
 }
 
 .model-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: var(--spacing-md);
+  gap: var(--spacing-sm);
   width: 100%;
+  max-width: 700px;
 }
 
 .model-card {
-  display: flex; flex-direction: column; align-items: center; gap: var(--spacing-sm);
-  padding: var(--spacing-lg) var(--spacing-sm);
-  background: var(--color-border-subtle);
+  display: flex; flex-direction: column; align-items: center; gap: 0.35rem;
+  padding: var(--spacing-md) var(--spacing-xs);
+  background: rgba(255, 255, 255, 0.02);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -451,14 +456,14 @@
 
 .model-card:hover {
   border-color: var(--card-color);
-  background: var(--color-border);
-  transform: translateY(-4px);
-  box-shadow: 0 12px 24px rgba(0, 0, 0, 0.4);
+  background: rgba(255, 255, 255, 0.05);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.4);
 }
 
-.card-icon { font-size: 1.75rem; }
-.card-name { font-weight: 600; color: var(--card-color); font-size: 0.85rem; }
-.card-desc { font-size: 0.65rem; color: var(--color-text-muted); text-align: center; padding: 0 var(--spacing-sm); }
+.card-icon { font-size: 1.4rem; }
+.card-name { font-weight: 700; color: var(--card-color); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.card-desc { font-size: 0.6rem; color: var(--color-text-muted); text-align: center; padding: 0 var(--spacing-xs); line-height: 1.4; }
 
 .messages-list { max-width: var(--max-content-width); margin: 0 auto; display: flex; flex-direction: column; gap: var(--spacing-lg); }
 
@@ -627,13 +632,25 @@
 }
 
 .chat-input-container {
-  background: rgba(10, 10, 10, 0.95);
+  background: rgba(10, 10, 10, 0.85);
   border-top: 1px solid var(--color-border);
-  padding: var(--spacing-lg) var(--spacing-lg) calc(var(--spacing-lg) + env(safe-area-inset-bottom));
+  padding: 0.75rem var(--spacing-lg) calc(0.75rem + env(safe-area-inset-bottom));
   backdrop-filter: blur(24px);
+  position: relative;
 }
 
-.input-wrapper { max-width: var(--max-content-width); margin: 0 auto; display: flex; flex-direction: column; gap: var(--spacing-sm); }
+.chat-input-container::before {
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--color-primary), var(--color-accent), transparent);
+  opacity: 0.3;
+}
+
+.input-wrapper { max-width: var(--max-content-width); margin: 0 auto; display: flex; flex-direction: column; gap: 0.5rem; }
 
 .draft-preview-container {
   background: var(--color-primary-dim);
