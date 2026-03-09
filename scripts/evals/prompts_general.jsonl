@@ -1,0 +1,40 @@
+{"id":"g001","category":"planning","prompt":"I'm building a SaaS app and need to decide between a monorepo and a multi-repo setup. What should I consider?"}
+{"id":"g002","category":"tradeoffs","prompt":"Compare Redis and PostgreSQL for a session store. Which is better and why?"}
+{"id":"g003","category":"tradeoffs","prompt":"Should I use REST or GraphQL for a new API that serves both mobile and web clients?"}
+{"id":"g004","category":"planning","prompt":"I need to migrate a 50GB PostgreSQL database with zero downtime. Walk me through a realistic plan."}
+{"id":"g005","category":"reasoning","prompt":"Why do distributed systems have to choose between consistency and availability? Is there a way around this?"}
+{"id":"g006","category":"critique","prompt":"Here is my database schema for a multi-tenant SaaS app: users table with a tenant_id column, and all tables join through tenant_id. What are the risks?"}
+{"id":"g007","category":"hidden_failure_modes","prompt":"My app uses JWTs for auth. I store them in localStorage. What could go wrong?"}
+{"id":"g008","category":"tradeoffs","prompt":"I'm considering using an LLM to classify incoming support tickets. What are the tradeoffs vs a traditional ML classifier?"}
+{"id":"g009","category":"ambiguous","prompt":"We keep having incidents. How do we improve our reliability?"}
+{"id":"g010","category":"planning","prompt":"My team wants to add feature flags. Walk me through a minimal implementation that avoids common pitfalls."}
+{"id":"g011","category":"critique","prompt":"We're using a single Supabase project for all customers. Row Level Security enforces tenant isolation. Is this safe?"}
+{"id":"g012","category":"hidden_failure_modes","prompt":"We're caching API responses in Redis with a 5-minute TTL. What failure modes should we watch for?"}
+{"id":"g013","category":"reasoning","prompt":"Explain why database indexes can make writes slower but reads faster. Under what conditions do indexes hurt more than they help?"}
+{"id":"g014","category":"tradeoffs","prompt":"Should we build our own auth system or use a third-party provider like Auth0 or Supabase Auth?"}
+{"id":"g015","category":"planning","prompt":"I need to implement rate limiting on our API. What are the practical approaches and their tradeoffs?"}
+{"id":"g016","category":"hidden_failure_modes","prompt":"We use optimistic locking with a version column to prevent lost updates. What are the edge cases?"}
+{"id":"g017","category":"critique","prompt":"Our CI pipeline runs all tests on every commit. It takes 25 minutes. How should we think about fixing this?"}
+{"id":"g018","category":"ambiguous","prompt":"Our app is getting slow. Where do we start?"}
+{"id":"g019","category":"tradeoffs","prompt":"We're building an event-driven system with Kafka. When is event sourcing a good idea vs. a bad idea in this context?"}
+{"id":"g020","category":"reasoning","prompt":"Why is it hard to achieve exactly-once delivery in a distributed messaging system?"}
+{"id":"g021","category":"planning","prompt":"I need to roll out a major database schema change to production with minimal risk. What's the process?"}
+{"id":"g022","category":"critique","prompt":"We log every incoming API request body including user-submitted content. Is that a problem?"}
+{"id":"g023","category":"hidden_failure_modes","prompt":"We're building a webhook delivery system. What can go wrong at scale that we might not think of upfront?"}
+{"id":"g024","category":"tradeoffs","prompt":"Compare SSR, SSG, and CSR for a content-heavy SaaS dashboard. Which approach and when?"}
+{"id":"g025","category":"reasoning","prompt":"Why is premature optimization considered harmful, but also why is ignoring performance sometimes catastrophic?"}
+{"id":"g026","category":"planning","prompt":"We need to implement audit logging for a compliance requirement. What should we capture and how should we store it?"}
+{"id":"g027","category":"critique","prompt":"Our deployment process is: merge to main triggers a CI run, on pass auto-deploys to production. What are the risks?"}
+{"id":"g028","category":"tradeoffs","prompt":"We're choosing between a managed Kubernetes service and a PaaS like Fly.io or Railway. What should guide the decision?"}
+{"id":"g029","category":"ambiguous","prompt":"We want to make our product more secure. What should we prioritize?"}
+{"id":"g030","category":"hidden_failure_modes","prompt":"We use a background job queue to send transactional emails. What are the ways this can go wrong in production?"}
+{"id":"g031","category":"reasoning","prompt":"Explain the two-phase commit protocol and why it's rarely used in practice despite solving distributed transactions."}
+{"id":"g032","category":"planning","prompt":"I need to design an API versioning strategy for a public API that will have breaking changes over time."}
+{"id":"g033","category":"critique","prompt":"We store user passwords hashed with MD5. We are about to migrate to bcrypt. What's the migration strategy?"}
+{"id":"g034","category":"tradeoffs","prompt":"When should you use a message queue vs. direct HTTP calls between microservices?"}
+{"id":"g035","category":"hidden_failure_modes","prompt":"We're using database-level foreign keys everywhere. At scale, what problems can this create?"}
+{"id":"g036","category":"reasoning","prompt":"Why do some engineering teams use trunk-based development instead of long-lived feature branches?"}
+{"id":"g037","category":"planning","prompt":"We're adding a new third-party payment provider. What's the integration checklist to avoid surprises?"}
+{"id":"g038","category":"critique","prompt":"Our microservices each manage their own database. A single user action can span 4 services. How do we handle failures mid-transaction?"}
+{"id":"g039","category":"ambiguous","prompt":"We need to reduce our infrastructure costs. What should we look at first?"}
+{"id":"g040","category":"hidden_failure_modes","prompt":"We're using soft deletes (a deleted_at column) across all tables. What are the long-term problems with this approach?"}

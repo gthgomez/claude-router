@@ -41,6 +41,23 @@ import {
   selectDebateWorkerMaxTokens,
   serializeMessagesForCost,
 } from './debate_runtime.ts';
+import {
+  countHighCriticalIssues,
+  SKEPTIC_GEMINI_SCHEMA,
+  SYNTH_DECISION_GEMINI_SCHEMA,
+  type SkepticOutput,
+  type SynthDecision,
+  validateHighCriticalSurvival,
+  validateSkepticOutput,
+  validateSynthDecision,
+} from './smd_schemas.ts';
+import {
+  buildSmdDraftPrompt,
+  buildSmdFormatterPrompt,
+  buildSmdSkepticPrompt,
+  buildSmdSynthDecisionPrompt,
+} from './smd_prompts.ts';
+import { buildGoogleJsonPayload } from './provider_payloads.ts';
 
 // ============================================================================
 // TYPE DEFINITIONS
@@ -159,7 +176,7 @@ const CORS_HEADERS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-client-info, apikey',
   'Access-Control-Expose-Headers':
-    'X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level, X-Memory-Hits, X-Memory-Tokens, X-Cost-Estimate-USD, X-Cost-Pricing-Version, X-Debate-Mode, X-Debate-Profile, X-Debate-Trigger, X-Debate-Model, X-Debate-Cost-Note',
+    'X-Router-Model, X-Router-Model-Id, X-Provider, X-Model-Override, X-Router-Rationale, X-Complexity-Score, X-Gemini-Thinking-Level, X-Memory-Hits, X-Memory-Tokens, X-Cost-Estimate-USD, X-Cost-Pricing-Version, X-Debate-Mode, X-Debate-Profile, X-Debate-Trigger, X-Debate-Model, X-Debate-Cost-Note, X-SMD-Mode, X-SMD-Issue-Count, X-SMD-High-Critical-Count, X-SMD-Unresolved-Risk-Count, X-SMD-Parse-Status, X-SMD-Fast-Path',
 };
 
 const FUNCTION_TIMEOUT_MS = 55000;
@@ -207,6 +224,23 @@ const DEBATE_WORKER_MAX_TOKENS_VIDEO_UI = Number(Deno.env.get('DEBATE_WORKER_MAX
 const DEBATE_VIDEO_UI_SYNTHESIS_MAX_TOKENS = Number(Deno.env.get('DEBATE_VIDEO_UI_SYNTHESIS_MAX_TOKENS') || '') || 900;
 const DEBATE_VIDEO_UI_STAGE_TIMEOUT_MS = Number(Deno.env.get('DEBATE_VIDEO_UI_STAGE_TIMEOUT_MS') || '') || 18000;
 const DEBATE_VIDEO_UI_NOTES_MAX_CHARS = Number(Deno.env.get('DEBATE_VIDEO_UI_NOTES_MAX_CHARS') || '') || 8000;
+
+// ── SMD v1.1 Light flags ──────────────────────────────────────────────────────
+// Master switch — off by default; turn on only for controlled experiments.
+const ENABLE_SMD_LIGHT = envFlag('ENABLE_SMD_LIGHT', false);
+// Fast-path guard thresholds (tune without redeploying via env vars).
+const SMD_FAST_PATH_MIN_TOKENS = Number(Deno.env.get('SMD_FAST_PATH_MIN_TOKENS') || '') || 25;
+// SMD is locked to Gemini Flash for the experiment (cost control + single-model rule).
+const SMD_MODEL_TIER: RouterModel = 'gemini-3-flash';
+// Stage timeout for the non-streaming JSON stages (ms).
+const SMD_JSON_STAGE_TIMEOUT_MS = Number(Deno.env.get('SMD_JSON_STAGE_TIMEOUT_MS') || '') || 15000;
+// Draft output cap fed to later stages (chars, not tokens — cheap truncation guard).
+const SMD_DRAFT_MAX_CHARS = Number(Deno.env.get('SMD_DRAFT_MAX_CHARS') || '') || 6000;
+// Token budget caps per stage.
+const SMD_DRAFT_BUDGET = Number(Deno.env.get('SMD_DRAFT_BUDGET') || '') || 1500;
+const SMD_SKEPTIC_BUDGET = Number(Deno.env.get('SMD_SKEPTIC_BUDGET') || '') || 1024;
+const SMD_SYNTH_BUDGET = Number(Deno.env.get('SMD_SYNTH_BUDGET') || '') || 1024;
+const SMD_FORMATTER_BUDGET = MODEL_REGISTRY[SMD_MODEL_TIER].budgetCap;
 
 const GOOGLE_MODELS_CACHE_TTL_MS = 10 * 60 * 1000;
 let googleModelsCache: { fetchedAt: number; models: GoogleModelRecord[] } | null = null;
@@ -962,6 +996,367 @@ async function callProviderStream(
       return await callOpenAI(decision, allMessages, images, signal);
     case 'google':
       return await callGoogle(decision, allMessages, images, signal, geminiFlashThinkingLevel);
+  }
+}
+
+// ============================================================================
+// SMD v1.1 LIGHT — STRUCTURED GOOGLE CALL
+// ============================================================================
+
+/**
+ * Extracts the text content from a non-streaming Gemini generateContent response.
+ * The response envelope wraps the model output in candidates[0].content.parts[0].text.
+ * With responseMimeType="application/json", that text is the raw JSON string.
+ */
+function tryExtractGoogleStructuredText(responseText: string): string | undefined {
+  try {
+    const envelope = JSON.parse(responseText) as {
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    };
+    const text = envelope?.candidates?.[0]?.content?.parts?.[0]?.text;
+    return typeof text === 'string' && text.trim() ? text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Calls the Gemini generateContent (non-streaming) endpoint with native structured output.
+ * Used exclusively by SMD Skeptic and SynthDecision stages.
+ *
+ * Returns the raw response text (for JSON extraction) and HTTP status.
+ * Does NOT use SSE; caller must extract JSON from the envelope.
+ */
+async function callGoogleStructured(
+  decision: RouteDecision,
+  allMessages: Message[],
+  responseSchema: Record<string, unknown>,
+  signal: AbortSignal,
+): Promise<{ responseText: string; ok: boolean; status: number }> {
+  const resolvedModel = await resolveGoogleModelAlias(decision.model, signal);
+  const endpoint =
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(resolvedModel)}` +
+    `:generateContent?key=${encodeURIComponent(GOOGLE_API_KEY)}`;
+
+  const payload = buildGoogleJsonPayload(decision, allMessages, responseSchema);
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  const responseText = await response.text();
+  return { responseText, ok: response.ok, status: response.status };
+}
+
+// ============================================================================
+// SMD v1.1 LIGHT — FAST-PATH GUARD
+// ============================================================================
+
+/**
+ * Returns { skip: true, reason } when the prompt is too trivial for SMD.
+ * Skipped prompts route directly to the baseline single-pass path.
+ *
+ * Logic is intentionally simple and tunable via env vars.
+ * Logs are emitted by the caller so the run ID is available.
+ */
+const SMD_COMPLEXITY_SIGNALS = new Set([
+  'compare', 'comparison', 'tradeoff', 'trade-off', 'pros', 'cons',
+  'risk', 'risks', 'critique', 'criticize', 'review', 'evaluate',
+  'choose', 'best option', 'plan', 'strategy', 'downside', 'drawback',
+  'failure mode', 'failure modes', 'implications', 'recommend',
+  'recommendation', 'decision', 'dilemma', 'should i', 'what if',
+  'how should', 'why does', 'explain why', 'analyze', 'analysis',
+  'versus', ' vs ', 'alternatives', 'considerations',
+]);
+
+function smdFastPath(
+  query: string,
+  queryTokens: number,
+): { skip: boolean; reason: string } {
+  if (queryTokens < SMD_FAST_PATH_MIN_TOKENS) {
+    return {
+      skip: true,
+      reason: `token_count_below_threshold:${queryTokens}<${SMD_FAST_PATH_MIN_TOKENS}`,
+    };
+  }
+  const lower = query.toLowerCase();
+  const matched = [...SMD_COMPLEXITY_SIGNALS].filter((sig) => lower.includes(sig));
+  if (matched.length === 0) {
+    return { skip: true, reason: 'no_complexity_signal_words' };
+  }
+  return { skip: false, reason: '' };
+}
+
+// ============================================================================
+// SMD v1.1 LIGHT — STAGE LOG INTERFACE
+// ============================================================================
+
+interface SmdStageLog {
+  runId: string;
+  mode: 'smd_light';
+  provider: 'google';
+  modelTier: string;
+  modelId: string;
+  fastPathHit: boolean;
+  fastPathReason: string;
+  draftLatencyMs: number;
+  draftChars: number;
+  skepticLatencyMs: number;
+  skepticSchemaValid: boolean;
+  skepticParseRetries: number;
+  issueCount: number;
+  highCriticalCount: number;
+  synthLatencyMs: number;
+  synthSchemaValid: boolean;
+  synthParseRetries: number;
+  unresolvedRiskCount: number;
+  survivalViolations: string[];
+  formatterLatencyMs: number;
+  finalStatus: 'complete' | 'fallback_draft_empty' | 'fallback_skeptic_failed' | 'fallback_synth_failed' | 'fallback_formatter_failed' | 'error';
+}
+
+interface SmdRunResult {
+  upstream: UpstreamCallResult;
+  log: SmdStageLog;
+}
+
+// ============================================================================
+// SMD v1.1 LIGHT — PIPELINE ORCHESTRATOR
+// ============================================================================
+
+/**
+ * Runs the SMD Light pipeline: Draft → Skeptic → SynthDecision → Formatter.
+ *
+ * Returns null on any stage failure (caller falls back to baseline).
+ * All failures are logged with the run ID for eval analysis.
+ *
+ * Key design choices:
+ *  - Stages 1-3 are non-streaming (consume to text).
+ *  - Stage 4 (Formatter) is streaming — returned as UpstreamCallResult for
+ *    createNormalizedProxyStream(), identical to the normal provider call path.
+ *  - Gemini Flash is used for ALL stages (same-model experiment).
+ *  - Authorship masking is enforced by the prompt builders in smd_prompts.ts.
+ *  - Context sanitation: Formatter only sees accepted_changes + rewrite_instructions
+ *    + unresolved_risks (not rejected_criticisms).
+ */
+async function maybeRunSmdMode(params: {
+  userQuery: string;
+  allMessages: Message[];
+  signal: AbortSignal;
+  geminiFlashThinkingLevel: GeminiFlashThinkingLevel;
+}): Promise<SmdRunResult | null> {
+  const runId = crypto.randomUUID().slice(0, 8);
+  const smdDecisionBase = decisionFromModel(SMD_MODEL_TIER, 50, 'smd-light');
+  const modelId = MODEL_REGISTRY[SMD_MODEL_TIER].modelId;
+
+  const log: SmdStageLog = {
+    runId,
+    mode: 'smd_light',
+    provider: 'google',
+    modelTier: SMD_MODEL_TIER,
+    modelId,
+    fastPathHit: false,
+    fastPathReason: '',
+    draftLatencyMs: 0,
+    draftChars: 0,
+    skepticLatencyMs: 0,
+    skepticSchemaValid: false,
+    skepticParseRetries: 0,
+    issueCount: 0,
+    highCriticalCount: 0,
+    synthLatencyMs: 0,
+    synthSchemaValid: false,
+    synthParseRetries: 0,
+    unresolvedRiskCount: 0,
+    survivalViolations: [],
+    formatterLatencyMs: 0,
+    finalStatus: 'error',
+  };
+
+  try {
+    // ── STAGE 1: DRAFT ──────────────────────────────────────────────────────
+    const draftStart = Date.now();
+    const draftDecision: RouteDecision = { ...smdDecisionBase, budgetCap: SMD_DRAFT_BUDGET };
+    const draftMessages: Message[] = [
+      // Preserve conversation history context; replace final user message with draft prompt.
+      ...params.allMessages.slice(0, -1),
+      { role: 'user', content: buildSmdDraftPrompt(params.userQuery) },
+    ];
+
+    const draftUpstream = await callProviderStream(
+      draftDecision,
+      draftMessages,
+      [],
+      params.signal,
+      params.geminiFlashThinkingLevel,
+    );
+    const draftText = await consumeUpstreamToText(draftUpstream, params.signal, SMD_DRAFT_MAX_CHARS);
+    log.draftLatencyMs = Date.now() - draftStart;
+    log.draftChars = draftText.length;
+
+    if (!draftText.trim()) {
+      log.finalStatus = 'fallback_draft_empty';
+      console.warn(`[SMD][${runId}] draft stage returned empty text — fallback to baseline`);
+      console.log('[SMD] run:', JSON.stringify(log));
+      return null;
+    }
+
+    // ── STAGE 2: SKEPTIC (native structured JSON) ────────────────────────────
+    const skepticStart = Date.now();
+    const skepticDecision: RouteDecision = { ...smdDecisionBase, budgetCap: SMD_SKEPTIC_BUDGET };
+    const skepticMessages: Message[] = [
+      { role: 'user', content: buildSmdSkepticPrompt(params.userQuery, draftText) },
+    ];
+
+    let skepticOutput: SkepticOutput | null = null;
+    let skepticRetries = 0;
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      if (params.signal.aborted) break;
+      let rawResult: { responseText: string; ok: boolean; status: number };
+      try {
+        rawResult = await callGoogleStructured(
+          skepticDecision,
+          skepticMessages,
+          SKEPTIC_GEMINI_SCHEMA,
+          params.signal,
+        );
+      } catch (fetchErr) {
+        console.warn(`[SMD][${runId}] skeptic fetch error (attempt ${attempt}):`, fetchErr);
+        break;
+      }
+      if (!rawResult.ok) {
+        console.warn(`[SMD][${runId}] skeptic HTTP ${rawResult.status} (attempt ${attempt})`);
+        break;
+      }
+      const innerText = tryExtractGoogleStructuredText(rawResult.responseText);
+      const parsed = innerText ? tryParseJson(innerText) : undefined;
+      const validation = validateSkepticOutput(parsed);
+      if (validation.valid) {
+        skepticOutput = validation.data;
+        skepticRetries = attempt;
+        break;
+      }
+      console.warn(
+        `[SMD][${runId}] skeptic schema validation failed (attempt ${attempt}): ${validation.error}`,
+      );
+      skepticRetries = attempt + 1;
+    }
+    log.skepticLatencyMs = Date.now() - skepticStart;
+    log.skepticSchemaValid = skepticOutput !== null;
+    log.skepticParseRetries = skepticRetries;
+
+    if (!skepticOutput) {
+      log.finalStatus = 'fallback_skeptic_failed';
+      console.warn(`[SMD][${runId}] skeptic stage failed — fallback to baseline`);
+      console.log('[SMD] run:', JSON.stringify(log));
+      return null;
+    }
+    log.issueCount = skepticOutput.issues.length;
+    log.highCriticalCount = countHighCriticalIssues(skepticOutput);
+
+    // ── STAGE 3: SYNTH DECISION (native structured JSON) ─────────────────────
+    const synthStart = Date.now();
+    const synthDecisionModel: RouteDecision = { ...smdDecisionBase, budgetCap: SMD_SYNTH_BUDGET };
+    const synthMessages: Message[] = [
+      {
+        role: 'user',
+        content: buildSmdSynthDecisionPrompt(params.userQuery, draftText, skepticOutput),
+      },
+    ];
+
+    let synthDecision: SynthDecision | null = null;
+    let synthRetries = 0;
+    for (let attempt = 0; attempt <= 1; attempt++) {
+      if (params.signal.aborted) break;
+      let rawResult: { responseText: string; ok: boolean; status: number };
+      try {
+        rawResult = await callGoogleStructured(
+          synthDecisionModel,
+          synthMessages,
+          SYNTH_DECISION_GEMINI_SCHEMA,
+          params.signal,
+        );
+      } catch (fetchErr) {
+        console.warn(`[SMD][${runId}] synth fetch error (attempt ${attempt}):`, fetchErr);
+        break;
+      }
+      if (!rawResult.ok) {
+        console.warn(`[SMD][${runId}] synth HTTP ${rawResult.status} (attempt ${attempt})`);
+        break;
+      }
+      const innerText = tryExtractGoogleStructuredText(rawResult.responseText);
+      const parsed = innerText ? tryParseJson(innerText) : undefined;
+      const validation = validateSynthDecision(parsed);
+      if (validation.valid) {
+        synthDecision = validation.data;
+        synthRetries = attempt;
+        break;
+      }
+      console.warn(
+        `[SMD][${runId}] synth schema validation failed (attempt ${attempt}): ${validation.error}`,
+      );
+      synthRetries = attempt + 1;
+    }
+    log.synthLatencyMs = Date.now() - synthStart;
+    log.synthSchemaValid = synthDecision !== null;
+    log.synthParseRetries = synthRetries;
+
+    if (!synthDecision) {
+      log.finalStatus = 'fallback_synth_failed';
+      console.warn(`[SMD][${runId}] synth decision stage failed — fallback to baseline`);
+      console.log('[SMD] run:', JSON.stringify(log));
+      return null;
+    }
+    log.unresolvedRiskCount = synthDecision.unresolved_risks.length;
+
+    // Validate high/critical survival rule — violations are logged but do not abort.
+    // If this fires frequently in eval, the SynthDecision prompt needs strengthening.
+    const violations = validateHighCriticalSurvival(skepticOutput, synthDecision);
+    log.survivalViolations = violations;
+    if (violations.length > 0) {
+      console.warn(
+        `[SMD][${runId}] survival rule violations for issue ids: ${violations.join(', ')}` +
+          ' — high/critical issues not accounted for in accepted/rejected/unresolved',
+      );
+    }
+
+    // ── STAGE 4: FORMATTER (streaming, returned as UpstreamCallResult) ───────
+    const formatterStart = Date.now();
+    const formatterDecision: RouteDecision = {
+      ...smdDecisionBase,
+      budgetCap: SMD_FORMATTER_BUDGET,
+      rationaleTag: 'smd-formatter',
+    };
+    const formatterMessages: Message[] = [
+      // Include conversation history for context continuity.
+      ...params.allMessages.slice(0, -1),
+      {
+        role: 'user',
+        content: buildSmdFormatterPrompt(params.userQuery, draftText, synthDecision),
+      },
+    ];
+
+    const formatterUpstream = await callProviderStream(
+      formatterDecision,
+      formatterMessages,
+      [],
+      params.signal,
+      params.geminiFlashThinkingLevel,
+    );
+    log.formatterLatencyMs = Date.now() - formatterStart;
+    log.finalStatus = 'complete';
+
+    console.log('[SMD] run complete:', JSON.stringify(log));
+
+    return { upstream: formatterUpstream, log };
+  } catch (err) {
+    log.finalStatus = 'error';
+    console.error(`[SMD][${runId}] unexpected error:`, err);
+    console.log('[SMD] run:', JSON.stringify(log));
+    return null;
   }
 }
 
@@ -1886,8 +2281,67 @@ Deno.serve(async (req: Request) => {
     let debateModelTierEffective = '';
     let responseDecision: RouteDecision = decision;
 
+    // SMD state — declared alongside debate state for the same reason.
+    let smdActive = false;
+    let smdRunLog: SmdStageLog | null = null;
+
     let upstream: UpstreamCallResult;
     try {
+      // ── SMD v1.1 Light branch ─────────────────────────────────────────────
+      // Checked before the existing debate branch. SMD is:
+      //   - Triggered by mode === 'smd_light' in the request body
+      //   - Gated by ENABLE_SMD_LIGHT env flag (default off)
+      //   - Restricted to text-only, no images, no video
+      //   - Locked to Gemini Flash regardless of normal routing decision
+      const smdRequested = String(mode || '').trim().toLowerCase() === 'smd_light';
+      const smdEligible = ENABLE_SMD_LIGHT && smdRequested && !hasImages && !hasVideoAssets;
+
+      if (smdEligible) {
+        const queryTokens = countTokens(query);
+        const fastPath = smdFastPath(query, queryTokens);
+
+        if (fastPath.skip) {
+          console.log(`[SMD] fast-path triggered: ${fastPath.reason} — routing to baseline`);
+          // Fast-path: use the normally routed model (not forced to Gemini Flash).
+          upstream = await callProviderStream(
+            decision,
+            allMessages,
+            imageAttachments,
+            controller.signal,
+            normalizedGeminiFlashThinkingLevel,
+          );
+        } else {
+          const smdResult = await maybeRunSmdMode({
+            userQuery: query,
+            allMessages,
+            signal: controller.signal,
+            geminiFlashThinkingLevel: normalizedGeminiFlashThinkingLevel,
+          });
+
+          if (smdResult) {
+            upstream = smdResult.upstream;
+            smdActive = true;
+            smdRunLog = smdResult.log;
+            // SMD forces Gemini Flash for the entire pipeline; reflect in response decision.
+            responseDecision = decisionFromModel(
+              SMD_MODEL_TIER,
+              decision.complexityScore,
+              'smd-light',
+            );
+          } else {
+            // All stage failures fall back silently to the normal baseline path.
+            console.log('[SMD] pipeline returned null — falling back to baseline');
+            upstream = await callProviderStream(
+              decision,
+              allMessages,
+              imageAttachments,
+              controller.signal,
+              normalizedGeminiFlashThinkingLevel,
+            );
+          }
+        }
+      } else {
+      // ── Existing debate + baseline branch (untouched) ─────────────────────
       const debateEligibility = computeDebateEligibility({
         profile: debateReq.profile,
         enableDebateMode: ENABLE_DEBATE_MODE,
@@ -1966,6 +2420,7 @@ Deno.serve(async (req: Request) => {
           normalizedGeminiFlashThinkingLevel,
         );
       }
+      } // end: else (not smdEligible)
     } catch (upstreamError) {
       const message = upstreamError instanceof Error
         ? upstreamError.message
@@ -2114,6 +2569,16 @@ Deno.serve(async (req: Request) => {
           debateTrigger: debateTriggerEffective,
           ...(debateModelTierEffective ? { debateModelTier: debateModelTierEffective } : {}),
         }),
+        // SMD headers are emitted ONLY when SMD pipeline ran (absent = SMD did not run).
+        ...(smdActive && smdRunLog ? {
+          'X-SMD-Mode': 'true',
+          'X-SMD-Issue-Count': String(smdRunLog.issueCount),
+          'X-SMD-High-Critical-Count': String(smdRunLog.highCriticalCount),
+          'X-SMD-Unresolved-Risk-Count': String(smdRunLog.unresolvedRiskCount),
+          'X-SMD-Parse-Status': (smdRunLog.skepticSchemaValid && smdRunLog.synthSchemaValid)
+            ? 'ok'
+            : 'degraded',
+        } : {}),
       },
     });
   } catch (error) {

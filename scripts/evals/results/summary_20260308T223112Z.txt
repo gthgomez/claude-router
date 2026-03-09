@@ -1,0 +1,22 @@
+SMD v1.1 Light — Eval Summary
+Run ID: 20260308T223112Z
+Model: gemini-2.0-flash-001
+Prompts: 40 | OK: 40 | Errors: 0
+
+== OVERALL RESULTS ==
+  SMD wins:       35 / 40  (87.5%)
+  Baseline wins:   0 / 40  (0.0%)
+  Ties:            5 / 40  (12.5%)
+
+== PER-CATEGORY BREAKDOWN ==
+  ambiguous                       smd=4 baseline=0 tie=0 err=0
+  critique                        smd=6 baseline=0 tie=1 err=0
+  hidden_failure_modes            smd=5 baseline=0 tie=2 err=0
+  planning                        smd=8 baseline=0 tie=0 err=0
+  reasoning                       smd=4 baseline=0 tie=2 err=0
+  tradeoffs                       smd=8 baseline=0 tie=0 err=0
+
+== HIGH/CRITICAL SURVIVAL VIOLATIONS ==
+  Prompts with violations: 0 / 40
+
+Raw output: results\raw_20260308T223112Z.jsonl

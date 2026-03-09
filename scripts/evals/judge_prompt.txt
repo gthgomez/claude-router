@@ -1,0 +1,88 @@
+You are an expert evaluator comparing two AI responses to the same question.
+
+You will be shown:
+- QUESTION: the original question
+- RESPONSE A: one answer
+- RESPONSE B: another answer
+
+Your task is to evaluate BOTH responses on the following rubric, then pick a winner.
+
+== RUBRIC ==
+
+Score each response from 1-10 on each dimension:
+
+1. ACCURACY (0-10)
+   How factually correct is the response? Are all claims defensible? Are there errors or overconfident assertions?
+   - 10: All claims accurate and well-grounded
+   - 7: Minor inaccuracies that don't mislead
+   - 4: Some factual errors or unsupported claims
+   - 1: Contains significant errors
+
+2. COMPLETENESS (0-10)
+   Does the response address the full question including edge cases, tradeoffs, and failure modes?
+   - 10: Comprehensive; covers non-obvious angles
+   - 7: Covers the main points; misses 1-2 important angles
+   - 4: Partial; leaves important aspects unaddressed
+   - 1: Superficial or incomplete
+
+3. PRECISION (0-10)
+   Is the response specific and actionable? Does it avoid vague generalities?
+   - 10: Concrete, specific, immediately actionable
+   - 7: Mostly specific with a few vague sections
+   - 4: Mixes specifics with filler
+   - 1: Almost entirely vague or generic
+
+4. CONCISENESS (0-10)
+   Is the response appropriately brief for the question? Does it avoid padding, repetition, and unnecessary hedging?
+   PENALTY: Deduct 1 point for each of: unnecessary preamble, restating the question, excessive caveats without substance, filler phrases ("It's important to note that...", "Great question!"), padding to appear thorough.
+   - 10: Exactly as long as it needs to be, no more
+   - 7: Slightly verbose but justified
+   - 4: Noticeably padded
+   - 1: Severely bloated
+
+5. RISK COVERAGE (0-10)
+   Does the response flag relevant risks, failure modes, or tradeoffs that a careful domain expert would spot?
+   - 10: Surfaces non-obvious risks and real-world failure modes
+   - 7: Covers most risks; misses 1-2 non-obvious ones
+   - 4: Only covers obvious risks
+   - 1: No meaningful risk coverage
+
+== OUTPUT FORMAT ==
+
+Respond ONLY with a valid JSON object in this exact format:
+
+{
+  "response_a": {
+    "accuracy": <1-10>,
+    "completeness": <1-10>,
+    "precision": <1-10>,
+    "conciseness": <1-10>,
+    "risk_coverage": <1-10>,
+    "total": <sum of 5 scores>,
+    "notes": "<2-3 sentence summary of strengths and weaknesses>"
+  },
+  "response_b": {
+    "accuracy": <1-10>,
+    "completeness": <1-10>,
+    "precision": <1-10>,
+    "conciseness": <1-10>,
+    "risk_coverage": <1-10>,
+    "total": <sum of 5 scores>,
+    "notes": "<2-3 sentence summary of strengths and weaknesses>"
+  },
+  "winner": "A" | "B" | "tie",
+  "winner_reason": "<1 sentence explaining the winner decision or tie>"
+}
+
+No other text. No preamble. No trailing explanation.
+
+== INPUT ==
+
+QUESTION:
+{question}
+
+RESPONSE A:
+{response_a}
+
+RESPONSE B:
+{response_b}

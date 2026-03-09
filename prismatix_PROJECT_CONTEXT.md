@@ -1,8 +1,24 @@
 # Prismatix - Project Context (Two-Tier LLM Format)
 
-Last updated: 2026-02-20
+Last updated: 2026-03-08
 Repository root: `C:\Users\icbag\Desktop\Project_SaaS\Prismatix`
-Verification basis: Local workspace code scan on 2026-02-20 (not a production deployment verification).
+Verification basis: Local workspace code scan on 2026-03-08 (not a production deployment verification).
+
+## 0) First-Time Agent/Human Onboarding (No Prior Repo Context)
+
+If you have never worked in this repo before, start in this order:
+
+1. `PROJECT_CONTEXT.md` (entrypoint and naming conventions)
+2. `prismatix_PROJECT_CONTEXT.md` (this file, full contracts/invariants)
+3. `LLM_COLLABORATION_SYSTEM/README_FOR_HUMANS_AND_LLMS.md`
+4. Tool-specific manifest: `AGENTS.md`, `CLAUDE.md`, or `GEMINI.md`
+
+If using a web LLM with no file access, upload:
+
+1. `PROJECT_CONTEXT.md`
+2. `prismatix_PROJECT_CONTEXT.md`
+3. `LLM_COLLABORATION_SYSTEM/WEB_UPLOAD_GUIDE.md`
+4. Relevant hot path files for the task (`supabase/functions/router/*`, `prismatix-frontend/src/*`, and any touched migration files)
 
 ## Tier 1: Core Context (Load First)
 
@@ -44,7 +60,7 @@ Optional:
 - `videoAssetIds: string[]`
 - `modelOverride: RouterModel`
 - `geminiFlashThinkingLevel: 'low' | 'high'`
-- `mode: 'debate'` — activate Debate Mode (ship-safe, off by default via env flag)
+- `mode: 'debate' | 'smd_light'` — activate advanced routing tools (Debate or SMD v1.1 Light)
 - `debateProfile: 'general' | 'code' | 'video_ui'` — challenger set for debate (default: `'general'`)
 - Legacy image compatibility fields: `imageData`, `mediaType`, `imageStorageUrl`
 
@@ -54,7 +70,7 @@ Stable contract (frontend parsing):
 - `X-Router-Model`
 - `X-Router-Model-Id`
 - `X-Provider`
-- `X-Model-Override` — value is `"debate:<profile>"` only when debate is explicitly requested and debate actually runs; `"auto"` or override value otherwise
+- `X-Model-Override` — value is `"debate:<profile>"` or `"smd-light"` when advanced modes run; `"auto"` otherwise.
 - `X-Router-Rationale`
 - `X-Complexity-Score`
 - `X-Gemini-Thinking-Level`
@@ -69,6 +85,14 @@ Additive (debate mode, present only when debate is active; absent otherwise):
 - `X-Debate-Trigger` — `"explicit"` | `"auto"`
 - `X-Debate-Model` — synthesis model tier used for debate response (debug header; emitted only when debate ran)
 - `X-Debate-Cost-Note` — `"partial"` when debate is active (synthesis cost only tracked)
+
+Additive (SMD v1.1 Light, present only when SMD is active):
+- `X-SMD-Mode` — `"smd_light"`
+- `X-SMD-Issue-Count` — number of issues found by Skeptic
+- `X-SMD-High-Critical-Count` — number of high/critical severity issues
+- `X-SMD-Unresolved-Risk-Count` — number of unresolved risks remaining in synthesis
+- `X-SMD-Parse-Status` — `"success" | "fallback"`
+- `X-SMD-Fast-Path` — `"true"` if fast-path guard triggered
 
 #### SSE stream shape
 
@@ -205,6 +229,7 @@ Migration order (current files):
 3. `supabase/migrations/20260212090000_add_cost_logs.sql`
 4. `supabase/migrations/20260216100000_add_video_pipeline.sql`
 5. `supabase/migrations/20260216103000_schedule_video_worker_cron.sql`
+6. `supabase/migrations/20260219100000_add_metadata_to_video_assets.sql`
 
 Primary tables/functions:
 - Chat: `public.conversations`, `public.messages`, `public.increment_token_count(...)`
@@ -333,38 +358,28 @@ Example:
   Guardrail: check for duplicate function folders before release.
 ```
 
-### 17) Debate Mode Architecture (added 2026-02-19)
+### 17) Debate Mode Architecture
 
-#### Design
+Debate Mode is a server-side multi-model critique pipeline (skeptic + synthesist) that runs before the final synthesis. Triggered by `mode: 'debate'` or `modelOverride: 'debate:<profile>'`.
 
-Debate Mode is a router "tool" (like streaming or thinking level) that runs multi-model critique before synthesis. All of it is server-side and transparent to frontend contract parsing.
+### 18) SMD v1.1 Light Architecture (Added 2026-03-08)
 
-**Flow when active:**
-1. `parseDebateRequest()` reads `mode` and `modelOverride` from body to detect explicit request.
-2. `getDebatePlan()` selects 1–2 cheap challenger models (never the same tier as primary).
-3. Challengers run in parallel via `Promise.all`; each has its own `AbortController` with bounded timeout (10–12 s).
-4. Challenger streams are consumed to text via `consumeUpstreamToText()` and bounded by `maxChallengerChars`.
-5. If zero challengers succeed → silent fallback to normal single-provider path.
-6. `buildSynthesisPrompt()` injects debate notes into a new user message.
-7. Synthesis calls `callProviderStream(decision, synthesisMessages, ...)` — the PRIMARY decision model, reusing the existing normalization chain.
-8. `createNormalizedProxyStream` + persistence pipeline run unchanged.
+SMD (Skeptic-Model-Drafting) is a 4-stage sequential pipeline for high-fidelity text synthesis:
 
-**Profiles:**
-- `general`: skeptic (gpt-5-mini) + synthesist (gemini-3-flash)
-- `code`: critic (gpt-5-mini) + implementer (haiku-4.5)
-- `video_ui`: UI Designer Critic + Product QA / UX Researcher + Customer Persona (workers + synthesis forced to Gemini ladder; video-only eligibility)
+1. **Draft:** Produce a direct candidate answer.
+2. **Skeptic:** Expert critical review of the draft (authorship-masked).
+3. **SynthDecision:** Adjudicate critique; decide accepted changes vs rejected vs unresolved risks.
+4. **Formatter:** Final synthesis applying only accepted changes and rewrite instructions.
 
-**Image/video requests:** never enter debate mode (MVP gate).
+**Constraints:**
+- Locked to `gemini-3-flash` for all stages (experiment mode).
+- Triggered by `mode: 'smd_light'` in body + `ENABLE_SMD_LIGHT` env flag.
+- Restricted to text-only (no images, no video assets).
+- Fast-path guard (`smdFastPath`) skips SMD for trivial queries (< 25 tokens or no complexity keywords).
 
 **Files:**
-- `supabase/functions/router/debate_profiles.ts` — profile configs, pure helpers
-- `supabase/functions/router/debate_prompts.ts` — prompt builders
-- `supabase/functions/router/debate_runtime.ts` — debate eligibility/gating, debate header construction, synthesis cost serialization
-- `supabase/functions/router/debate_runtime.ts` — debate eligibility/gating (including `video_ui`), timeout fallback helper, debate header construction, synthesis cost serialization
-- `supabase/functions/router/provider_payloads.ts` — provider max-token payload mapping helpers
-- `supabase/functions/router/sse_normalizer.ts` — normalized stream helper shared by router/tests
-- `supabase/functions/router/index.ts` — integration (imports, env flags, helpers, branch logic, headers)
-- `Tests/Debate_test.ts` — 55 tests (eligibility, prompts, SSE contract, header regression, runtime helper contract checks including `video_ui` + timeout fallback)
+- `supabase/functions/router/smd_prompts.ts` — stage-specific prompt builders
+- `supabase/functions/router/smd_schemas.ts` — validation and Gemini structured schemas
 
 ### 16) Run Discoveries
 
@@ -424,6 +439,7 @@ Debate Mode is a router "tool" (like streaming or thinking level) that runs mult
   Guardrail: treat `limit: 0` as an upstream entitlement signal first; verify active auth mode (`gemini-api-key` vs `oauth-personal`) before spending time on local cache resets.
 - 2026-02-20: no drift detected in Prismatix runtime code during post-login 403 troubleshooting. Verified user-scoped project override env vars were cleared, but OAuth requests still resolve to project `gen-lang-client-0908185798` and fail with `PERMISSION_DENIED` / `SERVICE_DISABLED` for `cloudaicompanion.googleapis.com` (Gemini for Google Cloud API). This confirms current blocker is API enablement/permission on the bound Google Cloud project, not local CLI cache.
 - 2026-02-21: Model upgrade pass — all RouterModel keys and underlying API modelIds updated to latest versions. Renames: `opus-4.5`→`opus-4.6` (modelId: `claude-opus-4-6`), `sonnet-4.5`→`sonnet-4.6` (modelId: `claude-sonnet-4-6`), `gemini-3-pro`→`gemini-3.1-pro` (modelId: `gemini-3.1-pro-preview`), `gemini-3-flash` modelId→`gemini-3-flash-preview`. `haiku-4.5` and `gpt-5-mini` unchanged. Backwards-compat synonyms added in `OVERRIDE_SYNONYMS` and `parseVideoUiModelLadder` so existing client overrides and env vars using old strings still resolve. `googleAliasScore` fuzzy branches updated to cover both old and new alias strings. All tests in Router/Debate/Cost suites updated accordingly. `prismatix_PROJECT_CONTEXT.md` routing rules synced.
+- 2026-03-08: Context Sync. Identified and documented SMD v1.1 Light (Skeptic-Model-Drafting) pipeline. Fixed migration drift (added 20260219 migration). Synchronized header contract to include `X-SMD-*` additive headers. Verified all routing thresholds match `router_logic.ts`.
 - 2026-02-20 [Future Tip] Area: Gemini CLI OAuth project binding (`cloudcode-pa.googleapis.com`)
   Trigger: After successful `/auth` login, requests failed with 403 `SERVICE_DISABLED` for `cloudaicompanion.googleapis.com` on project `gen-lang-client-0908185798`.
   Root cause: OAuth path is bound to a GCP project where Gemini for Google Cloud API is disabled; local model/env tweaks cannot bypass service-level deny.

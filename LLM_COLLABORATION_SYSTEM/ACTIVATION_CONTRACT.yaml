@@ -1,0 +1,45 @@
+version: 1
+project: Prismatix
+contract_type: activation_contract
+
+always_load:
+  - RULES_CORE.md
+  - RULES_CORE_MODEL_AGNOSTIC.md
+  - ADAPTER_PRISMATIX.md
+  - ADAPTER_PRISMATIX_PROJECT_INVARIANTS.md
+
+conditional_load:
+  - when:
+      tool_can_write_files: true
+    load:
+      - RULES_GUARD.md
+      - RULES_GUARD_EXECUTION_GATES.md
+  - when:
+      approval_mode_in:
+        - auto_edit
+        - yolo
+    load:
+      - RULES_GUARD.md
+      - RULES_GUARD_EXECUTION_GATES.md
+  - when:
+      task_mode_in:
+        - implement
+        - migrate
+        - deploy
+        - hotfix
+    load:
+      - RULES_GUARD.md
+      - RULES_GUARD_EXECUTION_GATES.md
+
+do_not_load_guard_when:
+  task_mode_in:
+    - research
+    - brainstorm
+    - architecture
+    - planning
+
+fallback_if_signal_missing:
+  load:
+    - RULES_CORE.md
+    - ADAPTER_PRISMATIX.md
+  note: Guard not loaded by default when execution intent is ambiguous.
