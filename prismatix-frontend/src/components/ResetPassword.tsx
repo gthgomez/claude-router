@@ -168,14 +168,17 @@ export const ResetPassword: React.FC = () => {
         .reset-container {
           min-height: 100vh;
           display: flex;
+          flex-direction: column;
           align-items: center;
           justify-content: center;
           background: #0a0a0a;
           padding: 2rem;
           font-family: 'Berkeley Mono', 'JetBrains Mono', 'Fira Code', monospace;
+          overflow-y: auto;
         }
 
         .reset-card {
+          margin: auto 0;
           width: 100%;
           max-width: 420px;
           background: rgba(20, 20, 20, 0.95);
